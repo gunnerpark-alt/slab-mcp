@@ -1,0 +1,19 @@
+{
+  "name": "slab-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for analyzing Clay tables — schema, rows, errors, and enrichment debugging",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": ["clay", "mcp", "debugging"],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "better-sqlite3": "^12.8.0"
+  }
+}

@@ -1,0 +1,239 @@
+/**
+ * Clay internal API client.
+ * Calls https://api.clay.com/v3/ — the same API the Clay frontend uses.
+ */
+
+import { getInternalApiHeaders } from './auth.js';
+
+const BASE = 'https://api.clay.com/v3';
+
+async function clayRequest(endpoint) {
+  const headers = getInternalApiHeaders();
+  const res = await fetch(`${BASE}${endpoint}`, { headers });
+
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ message: res.statusText }));
+    throw new Error(`Clay API ${res.status} on ${endpoint}: ${body.message || res.statusText}`);
+  }
+
+  return res.json();
+}
+
+async function clayPost(endpoint, body = {}) {
+  const headers = { ...getInternalApiHeaders(), 'Content-Type': 'application/json' };
+  const res = await fetch(`${BASE}${endpoint}`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body)
+  });
+
+  if (!res.ok) {
+    const errBody = await res.json().catch(() => ({ message: res.statusText }));
+    throw new Error(`Clay API ${res.status} on POST ${endpoint}: ${errBody.message || res.statusText}`);
+  }
+
+  return res.json();
+}
+
+/**
+ * Fetch table schema: field definitions, formulas, run conditions, source details, views.
+ */
+export async function getTableSchema(tableId, viewId) {
+  const tableData = await clayRequest(`/tables/${tableId}`);
+  const table     = tableData.table || tableData;
+  const fields    = table.fields || tableData.fields || [];
+  const gridViews = table.gridViews || tableData.gridViews || table.views || tableData.views || [];
+
+  const activeView     = gridViews.find(v => v.id === viewId);
+  const viewFieldOrder = activeView?.fieldOrder || [];
+
+  const orderedFieldIds = viewFieldOrder.length > 0
+    ? viewFieldOrder
+    : fields.map(f => f.id);
+
+  const orderedFields = [];
+  for (const fieldId of orderedFieldIds) {
+    if (fieldId === 'f_created_at' || fieldId === 'f_updated_at') continue;
+    const field = fields.find(f => f.id === fieldId);
+    if (!field) continue;
+    orderedFields.push({
+      id:           field.id,
+      name:         field.name,
+      type:         field.type,
+      typeSettings: field.typeSettings || null
+    });
+  }
+
+  // Enrich source columns with provider details
+  const sourceColumns = orderedFields.filter(f => f.type === 'source');
+  await Promise.all(sourceColumns.map(async field => {
+    const sourceIds = field.typeSettings?.sourceIds || [];
+    if (sourceIds.length === 0) return;
+    try {
+      field.sourceDetails = await Promise.all(
+        sourceIds.map(sid => clayRequest(`/sources/${sid}`))
+      );
+    } catch {}
+  }));
+
+  const defaultViewId = table.defaultViewId || table.defaultGridViewId
+    || tableData.defaultViewId || tableData.defaultGridViewId
+    || gridViews[0]?.id || null;
+
+  const allRowsView = gridViews.find(v =>
+    v.name && v.name.toLowerCase().replace(/[\s_\-]/g, '') === 'allrows'
+  );
+  const bestViewId = allRowsView?.id || viewId || defaultViewId;
+
+  return {
+    capturedAt:  new Date().toISOString(),
+    tableId,
+    viewId:      bestViewId,
+    tableName:   table.name || tableData.name || tableId,
+    rowCount:    table.rowCount || table.recordCount || tableData.rowCount || tableData.recordCount || null,
+    fieldCount:  orderedFields.length,
+    views:       gridViews.map(v => ({ id: v.id, name: v.name })),
+    fields:      orderedFields,
+    fieldOrder:  orderedFieldIds.filter(id => id !== 'f_created_at' && id !== 'f_updated_at')
+  };
+}
+
+/**
+ * Get the default view ID for a table.
+ */
+export async function getDefaultViewId(tableId) {
+  const tableData = await clayRequest(`/tables/${tableId}`);
+  const table     = tableData.table || tableData;
+  const views     = table.gridViews || table.views || tableData.gridViews || tableData.views || [];
+  return table.defaultViewId || table.defaultGridViewId
+    || tableData.defaultViewId || tableData.defaultGridViewId
+    || views[0]?.id || null;
+}
+
+/**
+ * List rows with display values + statuses (paginated).
+ * No fullContent — use getRecord() for that.
+ *
+ * Options:
+ *   limit     — max rows to return (default: all)
+ *   query     — text filter (case-insensitive match on display values)
+ *   pageSize  — rows per API page (default: 100)
+ */
+export async function listRows(tableId, viewId, { limit, query, pageSize = 100 } = {}) {
+  if (!viewId) viewId = await getDefaultViewId(tableId);
+  if (!viewId) throw new Error('No view ID — pass one in the URL or ensure the table has a default view');
+
+  const rows = [];
+  let offset = 0;
+  const searchLower = query ? query.toLowerCase() : null;
+
+  while (true) {
+    const data = await clayRequest(`/tables/${tableId}/views/${viewId}/records?limit=${pageSize}&offset=${offset}`);
+    const page = data.results || [];
+    if (page.length === 0) break;
+
+    if (searchLower) {
+      for (const row of page) {
+        const cells = row.cells || {};
+        const match = Object.values(cells).some(cell => {
+          const val = cell.value;
+          return val != null && String(val).toLowerCase().includes(searchLower);
+        });
+        if (match) {
+          rows.push(row);
+          if (limit && rows.length >= limit) return rows;
+        }
+      }
+    } else {
+      rows.push(...page);
+      if (limit && rows.length >= limit) return rows.slice(0, limit);
+    }
+
+    if (page.length < pageSize) break;
+    offset += page.length;
+    await new Promise(r => setTimeout(r, 350));
+  }
+
+  return rows;
+}
+
+/**
+ * Fetch a single record with full enrichment JSON (externalContent).
+ */
+export async function getRecord(tableId, recordId) {
+  return clayRequest(`/tables/${tableId}/records/${recordId}`);
+}
+
+/**
+ * Export table to CSV via async job. Returns { downloadUrl, totalRows }.
+ * Faster than paginated listRows for full table fetches.
+ * CSV contains display values only — no cell statuses or nested JSON.
+ */
+export async function exportTableToCsv(tableId, viewId) {
+  if (!viewId) viewId = await getDefaultViewId(tableId);
+  if (!viewId) throw new Error('No view ID — pass one in the URL or ensure the table has a default view');
+
+  const job = await clayPost(`/tables/${tableId}/views/${viewId}/export`);
+  const jobId = job.id;
+  if (!jobId) throw new Error('Export job creation failed — no ID in response');
+
+  const pollIntervalMs = 1200;
+  const maxWaitMs = 5 * 60 * 1000;
+  const startedAt = Date.now();
+
+  while (true) {
+    await new Promise(r => setTimeout(r, pollIntervalMs));
+    const status = await clayRequest(`/exports/${jobId}`);
+
+    if (status.status === 'FINISHED') {
+      return {
+        downloadUrl: status.downloadUrl,
+        totalRows: status.recordsExportedCount ?? null
+      };
+    }
+
+    if (status.status === 'FAILED' || status.status === 'CANCELLED') {
+      throw new Error(`Export job ${jobId} ended with status: ${status.status}`);
+    }
+
+    if (Date.now() - startedAt > maxWaitMs) {
+      throw new Error(`Export job ${jobId} timed out after ${maxWaitMs / 1000}s`);
+    }
+  }
+}
+
+/**
+ * Fetch a single page of rows at a specific offset.
+ * Used to resolve row IDs by CSV position.
+ */
+export async function getRowsPage(tableId, viewId, offset, limit = 1) {
+  if (!viewId) viewId = await getDefaultViewId(tableId);
+  const data = await clayRequest(`/tables/${tableId}/views/${viewId}/records?limit=${limit}&offset=${offset}`);
+  return data.results || [];
+}
+
+/**
+ * Download CSV text from a signed S3 URL.
+ */
+export async function fetchCsv(downloadUrl) {
+  const res = await fetch(downloadUrl);
+  if (!res.ok) throw new Error(`Failed to download CSV: ${res.status}`);
+  return res.text();
+}
+
+/**
+ * List all tables in a workbook.
+ */
+export async function getWorkbookTables(workbookId) {
+  try {
+    const result = await clayRequest(`/workbooks/${workbookId}`);
+    const tables = result.tables || result.workbook?.tables || result.data?.tables;
+    if (Array.isArray(tables) && tables.length > 0) return tables;
+  } catch {}
+
+  const result = await clayRequest(`/workbooks/${workbookId}/tables`);
+  const tables = result.tables || result.data || (Array.isArray(result) ? result : null);
+  if (Array.isArray(tables) && tables.length > 0) return tables;
+
+  throw new Error(`Could not discover tables for workbook ${workbookId}`);
+}

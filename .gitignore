@@ -1,0 +1,26 @@
+# dependencies
+node_modules/
+
+# macOS
+.DS_Store
+
+# logs
+*.log
+npm-debug.log*
+
+# editor / env
+.env
+.env.*
+.vscode/
+.idea/
+
+# runtime / session state
+.claude/
+*.tmp
+tmp/
+
+# ad-hoc probes that aren't real tests yet
+# (remove these from the ignore once they have assertions)
+# test.js
+# test-export.js
+# test-workbook.js
