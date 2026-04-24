@@ -24,7 +24,6 @@ What you can do with it, out of the box:
 - **macOS.** Cookie-reader is Chrome + Keychain specific. Cross-platform auth is on the roadmap.
 - **Node ≥ 18.** Uses native `fetch` + ESM.
 - **Google Chrome**, logged into Clay in any profile. Cookie is read from Chrome's on-disk SQLite DB on every call.
-- **No external KB setup needed.** The 13 knowledge-base markdown files ship inside the repo under `kb/`. `read_kb` reads from there — no symlink, no separate install.
 
 ---
 
