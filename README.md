@@ -24,7 +24,7 @@ What you can do with it, out of the box:
 - **macOS.** Cookie-reader is Chrome + Keychain specific. Cross-platform auth is on the roadmap.
 - **Node ≥ 18.** Uses native `fetch` + ESM.
 - **Google Chrome**, logged into Clay in any profile. Cookie is read from Chrome's on-disk SQLite DB on every call.
-- **Clay knowledge base** (for `read_kb`) at `~/clay-kb/wiki/`. Ships separately — see [Knowledge base](#knowledge-base).
+- **No external KB setup needed.** The 13 knowledge-base markdown files ship inside the repo under `kb/`. `read_kb` reads from there — no symlink, no separate install.
 
 ---
 
@@ -162,7 +162,9 @@ Clay Functions are tables invoked from a parent column with `actionKey: "execute
 
 ## Knowledge base
 
-`read_kb` reads markdown files from `~/clay-kb/wiki/`. The 13 topics:
+The 13 reference docs ship with the repo under [`kb/`](kb/) — no external setup, no symlink. `read_kb` reads from that bundled directory directly.
+
+The 13 topics:
 
 | Topic | What it covers |
 |---|---|
@@ -182,7 +184,9 @@ Clay Functions are tables invoked from a parent column with `actionKey: "execute
 
 The same content is also exposed as MCP resources (`clay-kb://formulas/syntax.md`, etc.) for clients that support resource reads.
 
-> The KB itself lives in a separate repo. `~/clay-kb/wiki/` is expected to be a symlink to wherever you keep the markdown files.
+### Updating the KB
+
+To refresh the bundled docs, edit the markdown files directly under `kb/` and commit. The server reads from the on-disk files at call time — no build step, no restart required (though an MCP reconnect is needed if the server is already running). PRs to improve any of the 13 topics welcome.
 
 ---
 
@@ -235,6 +239,7 @@ src/cookie-reader.js     Decrypts Chrome's on-disk cookie DB via Keychain
 src/row-utils.js         CSV parsing, status analysis, record formatting
 src/schema-analyzer.js   (retained for future use; not wired into any current tool)
 src/summary-generator.js Markdown summary rendering for sync_table / get_errors
+kb/                      Bundled Clay knowledge base — 13 markdown files served by read_kb
 ```
 
 ### Session caches
@@ -276,7 +281,6 @@ There's no test suite yet. Contributions welcome.
 - **Cookie auth only.** API key support is desired but the internal `/v3/` API slab uses doesn't accept keys today.
 - **No persistent cache.** Every server restart rehydrates from Clay. For large workbooks this is a few seconds of re-sync.
 - **No test suite.** `test*.js` files are manual probes, not assertions.
-- **KB symlink is not managed.** `~/clay-kb/wiki/` must be set up out-of-band.
 
 ---
 

@@ -13,11 +13,13 @@
  */
 
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 import { getTableSchema, listRows, getRecord, getWorkbookTables, exportTableToCsv, fetchCsv, getRowsPage } from './src/clay-api.js';
 import { analyzeRowStatuses, formatRowsForDisplay, formatRecord, parseCsv, searchCsvRows } from './src/row-utils.js';
@@ -865,7 +867,9 @@ DON'T USE WHEN: Schema alone answers the question. Most table-specific questions
 // Knowledge Base Resources (also exposed as MCP resources for clients that support them)
 // ---------------------------------------------------------------------------
 
-const WIKI_BASE = path.join(os.homedir(), 'clay-kb', 'wiki');
+// Knowledge base lives inside the repo so the MCP is self-contained —
+// no external symlink or separate install required.
+const WIKI_BASE = path.join(__dirname, 'kb');
 
 const KB_RESOURCES = [
   {
