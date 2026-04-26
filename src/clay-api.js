@@ -60,7 +60,8 @@ export async function getTableSchema(tableId, viewId) {
       id:           field.id,
       name:         field.name,
       type:         field.type,
-      typeSettings: field.typeSettings || null
+      typeSettings: field.typeSettings || null,
+      pricing:      field.actionDefinition?.pricing || null
     });
   }
 

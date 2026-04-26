@@ -105,6 +105,16 @@ export function generateTableSummary(schema) {
       if (a.typeSettings?.authAccountId) {
         lines.push(`- **Auth Account:** \`${a.typeSettings.authAccountId}\``);
       }
+      if (a.pricing?.credits) {
+        const c = a.pricing.credits;
+        const parts = Object.entries(c).map(([k, v]) => `${k}: ${v}`).join(', ');
+        lines.push(`- **Credit Cost (per run):** ${parts}`);
+        const post = a.pricing.postPricingChange2026?.credits;
+        if (post && JSON.stringify(post) !== JSON.stringify(c)) {
+          const postParts = Object.entries(post).map(([k, v]) => `${k}: ${v}`).join(', ');
+          lines.push(`- **Credit Cost (post-2026 pricing):** ${postParts}`);
+        }
+      }
       const outputType = a.typeSettings?.dataTypeSettings?.type || 'json';
       lines.push(`- **Output Type:** \`${outputType}\``);
       lines.push('');

@@ -144,6 +144,8 @@ export function searchCsvRows(rows, query, limit) {
 
 /**
  * Format a full record (from getRecord) with named columns and fullContent.
+ * Includes per-cell credit usage from externalContent.upfrontCreditUsage /
+ * additionalCreditUsage / hiddenValue.costDetails, and a _credits roll-up.
  */
 export function formatRecord(record, schema) {
   const columnMap = {};
@@ -151,15 +153,46 @@ export function formatRecord(record, schema) {
     columnMap[f.id] = f.name;
   }
 
+  let totalCredits = 0;
+  let cellsWithCredits = 0;
+
   const formatted = { _rowId: record.id };
   for (const [fieldId, cell] of Object.entries(record.cells || {})) {
     if (fieldId === 'f_created_at' || fieldId === 'f_updated_at') continue;
     const name = columnMap[fieldId] || fieldId;
-    formatted[name] = {
+
+    const ext        = cell.externalContent || {};
+    const upfront    = ext.upfrontCreditUsage?.totalCost ?? null;
+    const additional = ext.additionalCreditUsage?.totalCost ?? null;
+    const aiCost     = ext.hiddenValue?.costDetails?.totalCostToAIProvider ?? null;
+
+    const out = {
       value:       cell.value ?? null,
       status:      cell.metadata?.status || null,
-      fullContent: cell.externalContent?.fullValue ?? null
+      fullContent: ext.fullValue ?? null
+    };
+
+    if (upfront != null || additional != null || aiCost != null) {
+      const cellTotal = (upfront ?? 0) + (additional ?? 0);
+      out.credits = {
+        total:          cellTotal,
+        upfront:        upfront,
+        additional:     additional,
+        aiProviderCost: aiCost
+      };
+      totalCredits     += cellTotal;
+      cellsWithCredits += 1;
+    }
+
+    formatted[name] = out;
+  }
+
+  if (cellsWithCredits > 0) {
+    formatted._credits = {
+      total:           totalCredits,
+      billedCellCount: cellsWithCredits
     };
   }
+
   return formatted;
 }
