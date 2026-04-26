@@ -171,6 +171,21 @@ export async function getRecord(tableId, recordId) {
 }
 
 /**
+ * Server-side substring search across every cell in a view.
+ * Mirrors the Clay UI search box: case-insensitive .includes() on display
+ * values. Returns one entry per matching cell — { fieldId, recordId } —
+ * so the same recordId can repeat across columns. Server caps the
+ * response at 1000 cells; an identifier-column lookup almost never hits
+ * that, but a broad term against a wide table can.
+ */
+export async function searchRecords(tableId, viewId, searchTerm) {
+  if (!viewId) viewId = await getDefaultViewId(tableId);
+  if (!viewId) throw new Error('No view ID — pass one in the URL or ensure the table has a default view');
+  const data = await clayPost(`/tables/${tableId}/views/${viewId}/search`, { searchTerm });
+  return data.results || [];
+}
+
+/**
  * Export table to CSV via async job. Returns { downloadUrl, totalRows }.
  * Required for tables larger than RECORDS_API_CAP — the records API doesn't
  * paginate beyond that.

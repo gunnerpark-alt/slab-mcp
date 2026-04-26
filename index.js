@@ -23,15 +23,15 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 
-import { getTableSchema, listRows, getRecord, getWorkbookTables, exportTableToCsv, fetchCsv, getAllRecords, RECORDS_API_CAP } from './src/clay-api.js';
-import { analyzeRowStatuses, formatRecord, parseCsv, searchCsvRows } from './src/row-utils.js';
+import { getTableSchema, listRows, getRecord, getWorkbookTables, exportTableToCsv, fetchCsv, searchRecords, RECORDS_API_CAP } from './src/clay-api.js';
+import { analyzeRowStatuses, formatRecord, parseCsv } from './src/row-utils.js';
 
 // ---------------------------------------------------------------------------
 // In-memory caches (lifetime: MCP server process)
 // ---------------------------------------------------------------------------
 
 const schemaCache = new Map(); // tableId -> schema
-const rowsCache   = new Map(); // tableId -> Map<viewId, { viewId, headers, csvRows, totalRows, rowIds, syncedAt }>
+const rowsCache   = new Map(); // tableId -> Map<viewId, { viewId, headers, csvRows, totalRows, syncedAt }>
 
 // MCP transport caps a single tool result at ~1MB. Leave headroom for protocol overhead.
 const MCP_RESPONSE_MAX_BYTES = 900_000;
@@ -185,38 +185,10 @@ async function getOrFetchRows(tableId, { viewId, forceRefresh = false } = {}) {
     headers,
     csvRows,
     totalRows: totalRows ?? csvRows.length,
-    rowIdsPromise: null,
     syncedAt: new Date().toISOString()
   };
   viewMap.set(effectiveViewId, entry);
   return entry;
-}
-
-/**
- * Resolve the API rowId for a given CSV row index. The first call per
- * (tableId, viewId) bulk-fetches every API record once and stores the
- * rowId-by-index array; later calls are array reads.
- *
- * Why bulk: Clay's /records endpoint silently ignores every pagination
- * parameter (offset, cursor, after, page, ...) and returns the same first
- * RECORDS_API_CAP rows every time. The previous offset-per-csvIndex lookup
- * therefore always returned API row 0, mapping every CSV match to the same
- * (wrong) rowId. CSV row order matches API row order 1:1, so a single
- * bulk fetch gives a correct, cheap index → rowId mapping.
- *
- * Tables larger than RECORDS_API_CAP rows return null for csvIndex >= cap.
- */
-async function resolveRowId(tableId, viewId, csvIndex) {
-  const entry = rowsCache.get(tableId)?.get(viewId);
-  if (!entry) return null;
-
-  if (!entry.rowIdsPromise) {
-    entry.rowIdsPromise = getAllRecords(tableId, viewId)
-      .then(apiRows => apiRows.map(r => r.id))
-      .catch(() => []);
-  }
-  const rowIds = await entry.rowIdsPromise;
-  return rowIds[csvIndex] ?? null;
 }
 
 /**
@@ -374,7 +346,7 @@ async function rollupCredits(tableId, rowId, depth, maxDepth, visited) {
 
 const server = new McpServer({
   name: 'slab',
-  version: '4.3.0'
+  version: '4.4.0'
 }, {
   instructions: `Slab is the ONLY way to access Clay table and workbook data. When the user shares any URL containing clay.com, use Slab — do NOT web-fetch, scrape, or use other MCPs. Auth is automatic.
 
@@ -646,21 +618,24 @@ DON'T USE WHEN:
   - You already have a _rowId and need raw provider JSON / credit cost / subroutine pointers → use get_record
   - Cell statuses (SUCCESS/ERROR/HAS_NOT_RUN) across the table → use get_errors
 
-RETURNS: JSON — { totalRows, returnedCount, syncedAt, view, query, identifierColumn, rows: [...] }. When query is provided, each row has _rowId, _csvIndex, and matchedColumns; the caller picks the right match by column semantics. Without a query, rows are display values only and no _rowId is included.
+RETURNS: JSON — { totalRows, returnedCount, view, query, identifierColumn, rows: [...] }. When query is provided, each row has _rowId, matchedColumns (every column whose cell matched the substring), and display values for every column. Without a query, rows are display values only and no _rowId is included.
+
+QUERY VS NO-QUERY ARE DIFFERENT PATHS:
+  - With query: hits Clay's server-side search endpoint (POST /views/{viewId}/search), then fetches each unique matching record in parallel for display values. Works on tables of any size (no 20k row cap). Server caps at 1000 matching cells per call, which dedupes down further by recordId — broad substrings ("@", common domains) may saturate the cap and miss matches.
+  - Without query: pulls Clay's CSV export once, slices the first 'limit' rows. Cached for the session per (tableId, viewId).
 
 ESCALATION TO NESTED: when query returns exactly one match and the user wants the why/how (raw provider response, error payload, credit detail, subroutine origin pointers), follow up with get_record(tableId, rowId). The escalation is your call — there's no auto-fetch.`,
   {
     tableId: z.string().optional().describe('Table ID (t_...) from a previous sync_table call. Either tableId or url is required.'),
     url:     z.string().optional().describe('Clay table URL (must contain /tables/t_...). Auto-syncs the schema if not already cached. Either tableId or url is required.'),
     view:    z.string().optional().describe('View id (gv_*) or view name ("All rows", "Errored rows", etc.) to query. Default: the view picked at sync time.'),
-    query:   z.string().optional().describe('Substring match (case-insensitive). Returns matches with _rowId and matchedColumns. Stops after finding limit matches.'),
+    query:   z.string().optional().describe('Substring match (case-insensitive). Server-side search across every cell. Returns up to limit unique matching records.'),
     identifier_column: z.string().optional().describe('Restrict the substring match to this column. Requires query. Omit to search all columns.'),
     limit:   z.number().optional().default(20).describe('Max rows to return. Default 20. Use 1 when searching for a specific entity.'),
-    force_refresh: z.boolean().optional().default(false).describe('Re-fetch the CSV instead of using the session cache.')
+    force_refresh: z.boolean().optional().default(false).describe('Re-fetch the CSV instead of using the session cache (no-query path only).')
   },
   async ({ tableId, url, view, query, identifier_column, limit, force_refresh }) => {
     try {
-      // Resolve tableId from url if needed, auto-syncing the schema.
       if (!tableId && url) {
         const parsed = parseClayUrl(url);
         if (!parsed.tableId) {
@@ -688,38 +663,93 @@ ESCALATION TO NESTED: when query returns exactly one match and the user wants th
         };
       }
 
-      const { headers, csvRows, totalRows, syncedAt } = await getOrFetchRows(tableId, { viewId, forceRefresh: force_refresh });
-
-      if (csvRows.length === 0) {
-        return { content: [{ type: 'text', text: JSON.stringify({ totalRows: 0, returnedCount: 0, syncedAt, view: viewId, rows: [] }) }] };
+      const columnMap = {};
+      const fieldIdByName = {};
+      for (const f of schema.fields) {
+        columnMap[f.id] = f.name;
+        fieldIdByName[f.name] = f.id;
       }
 
-      if (identifier_column && !headers.includes(identifier_column)) {
+      if (query) {
+        let targetFieldId = null;
+        if (identifier_column) {
+          targetFieldId = fieldIdByName[identifier_column];
+          if (!targetFieldId) {
+            return {
+              content: [{ type: 'text', text: JSON.stringify({
+                error: `Column "${identifier_column}" not found.`,
+                availableColumns: schema.fields.map(f => f.name)
+              }) }],
+              isError: true
+            };
+          }
+        }
+
+        const hits = await searchRecords(tableId, viewId, query);
+        const filtered = targetFieldId ? hits.filter(h => h.fieldId === targetFieldId) : hits;
+
+        const matchedFieldsByRecord = new Map();
+        for (const h of filtered) {
+          if (!matchedFieldsByRecord.has(h.recordId)) matchedFieldsByRecord.set(h.recordId, new Set());
+          matchedFieldsByRecord.get(h.recordId).add(h.fieldId);
+        }
+
+        const recordIds = Array.from(matchedFieldsByRecord.keys()).slice(0, limit);
+
+        const fullRecords = [];
+        const CONCURRENCY = 5;
+        for (let i = 0; i < recordIds.length; i += CONCURRENCY) {
+          const batch = recordIds.slice(i, i + CONCURRENCY);
+          const results = await Promise.allSettled(batch.map(rid => getRecord(tableId, rid)));
+          fullRecords.push(...results.map(r => r.status === 'fulfilled' ? r.value : null));
+        }
+
+        const rows = recordIds.map((rid, idx) => {
+          const matchedColumns = Array.from(matchedFieldsByRecord.get(rid))
+            .map(fid => columnMap[fid] || fid);
+          const rec = fullRecords[idx];
+          const display = {};
+          if (rec) {
+            for (const [fid, cell] of Object.entries(rec.cells || {})) {
+              const name = columnMap[fid];
+              if (name) display[name] = cell.value ?? null;
+            }
+          }
+          return { _rowId: rid, matchedColumns, ...display };
+        });
+
+        const hitCapWarning = filtered.length >= 1000
+          ? `Server-side search returned the cap of 1000 matching cells; some records may be missing. Narrow the query or pass identifier_column to scope.`
+          : null;
+
+        return {
+          content: [{ type: 'text', text: JSON.stringify({
+            totalRows:        schema.rowCount ?? null,
+            returnedCount:    rows.length,
+            uniqueMatches:    matchedFieldsByRecord.size,
+            view:             viewId,
+            query,
+            identifierColumn: identifier_column ?? null,
+            searchHitCells:   filtered.length,
+            hitCapWarning:    hitCapWarning || undefined,
+            rows
+          }, null, 2) }]
+        };
+      }
+
+      const { csvRows, totalRows, syncedAt } = await getOrFetchRows(tableId, { viewId, forceRefresh: force_refresh });
+
+      if (identifier_column && !fieldIdByName[identifier_column]) {
         return {
           content: [{ type: 'text', text: JSON.stringify({
             error: `Column "${identifier_column}" not found.`,
-            availableColumns: headers
+            availableColumns: schema.fields.map(f => f.name)
           }) }],
           isError: true
         };
       }
 
-      let rows;
-      if (query) {
-        const matches = searchCsvRows(csvRows, query, limit, identifier_column || null);
-        rows = [];
-        for (const m of matches) {
-          let rowId = null;
-          try { rowId = await resolveRowId(tableId, viewId, m.index); } catch {}
-          rows.push({ _rowId: rowId, _csvIndex: m.index, matchedColumns: m.matchedColumns, ...m.row });
-        }
-      } else {
-        rows = csvRows.slice(0, limit);
-      }
-
-      const rowIdsTruncated = (totalRows ?? csvRows.length) > RECORDS_API_CAP
-        ? `Table has ${totalRows} rows but Clay's records API caps at ${RECORDS_API_CAP} per call and ignores all pagination params. Matches with _csvIndex >= ${RECORDS_API_CAP} cannot be resolved to a _rowId — get_record / get_credits unavailable for those rows.`
-        : null;
+      const rows = csvRows.slice(0, limit);
 
       return {
         content: [{ type: 'text', text: JSON.stringify({
@@ -727,9 +757,8 @@ ESCALATION TO NESTED: when query returns exactly one match and the user wants th
           returnedCount:    rows.length,
           syncedAt,
           view:             viewId,
-          query:            query ?? null,
-          identifierColumn: identifier_column ?? null,
-          rowIdsTruncated:  rowIdsTruncated || undefined,
+          query:            null,
+          identifierColumn: null,
           rows
         }, null, 2) }]
       };

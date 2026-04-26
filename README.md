@@ -164,21 +164,19 @@ In Clay, a "function" is another table invoked from a parent column with `action
 
 The result: one call brings back the entire call graph the parent table participates in.
 
-### 2. Row lookup is a CSV bulk read + lazy rowId resolution
+### 2. Row lookup splits by mode: server-side search for queries, CSV bulk for samples
 
-Locating a row by value (`get_rows` with a query) is a three-step lookup, not a database index.
+`get_rows` has two completely different paths.
 
-**Bulk read once.** The first call on a table triggers Clay's async CSV export, polls until the download URL is ready, parses the CSV, and caches it in `rowsCache[tableId]` for the lifetime of the server. Subsequent searches on the same table skip the network entirely.
+**With a query — server-side search.** Slab posts to Clay's internal `POST /tables/{tableId}/views/{viewId}/search` endpoint with `{ searchTerm }`. Clay runs the same case-insensitive substring match its own UI search box uses, returning `{ results: [{ fieldId, recordId }] }` — one entry per matching cell, so the same record can repeat across columns. Slab dedupes by `recordId`, builds a `matchedColumns` list per match, then fetches each unique record in parallel (concurrency 5) to populate display values. One round-trip plus N record fetches, no row-count ceiling. Server caps at 1000 matching cells per response — broad substrings like `"@"` or a common domain may saturate it; slab surfaces a `hitCapWarning` when that happens.
 
-**In-memory substring scan.** Every search is a linear pass over the cached CSV — case-insensitive substring match. By default it scans every column; pass `identifier_column` to restrict to one. The result is a list of matches with the CSV index and a `matchedColumns` array per hit. No inverted index, no fuzzy/regex matching. ~1K rows × 20 columns is ~20K cell comparisons (sub-millisecond); for very large tables the CSV download itself is the bottleneck, not the scan.
+This replaced an earlier paginate-the-whole-CSV approach that on a 100k-row table scanned forever and could fail mid-way. Server-side search returns in seconds for any table size.
 
-**Bulk rowId resolution.** The CSV is display values only — no API `_rowId`. So when slab needs a rowId for a match, it pulls the full `/records?limit=20000` window once per `(tableId, viewId)` and indexes into the resulting array — CSV row order matches API row order 1:1, so `csvIndex` is also the API index. The fetch promise is memoized in `rowsCache.rowIdsPromise` so concurrent matches share one round-trip.
+**Without a query — CSV bulk read.** No query means the caller wants a sample (default `limit=20`) or is feeding fill-rate analysis. Slab triggers Clay's async CSV export, polls until ready, downloads, parses, and caches in `rowsCache[tableId]` per `(tableId, viewId)` for the lifetime of the server. Display values only, no rowIds. Subsequent calls hit the cache.
 
-The reason it's bulk, not per-match: Clay's `/records` endpoint silently ignores every pagination param we tested (`offset`, `cursor`, `after`, `page`, ...) and returns the same first 20k rows regardless. The earlier per-match `?offset=<csvIndex>` lookup therefore always returned API row 0 — every CSV match resolved to the same wrong `_rowId`. Bulk-fetch sidesteps the broken pagination entirely.
+The CSV path is also what powers `get_errors` and `get_credits` aggregate mode via `listRows`, which fetches up to `RECORDS_API_CAP` (20000) rows in one shot — the records API silently ignores every pagination param we tested (`offset`, `cursor`, `after`, `page`, ...), so anything past 20k rows requires the CSV export. `get_errors` flags `truncated` in its response when the view exceeds the cap so partial counts aren't read as full coverage.
 
-**Cap.** Tables larger than 20k rows can still be CSV-searched, but matches beyond row 20k come back with `_rowId: null` and the response carries a `rowIdsTruncated` note. CSV export remains the only path to *full* coverage on tables of that size.
-
-A search like `"acme"` will often hit multiple columns simultaneously — Name, URL, parent company. Each match's `matchedColumns` array is what Claude uses to pick the right hit. There's no script-side priority hierarchy.
+A search like `"acme"` will often hit multiple columns simultaneously — Name, URL, parent company. Each match's `matchedColumns` list is what Claude uses to pick the right hit. There's no script-side priority hierarchy.
 
 ### 3. Record tracing follows subroutine pointers down through execution
 
@@ -221,7 +219,7 @@ The `rowsCache` is keyed per `(tableId, viewId)` because views are different row
 Both caches live in-process and vanish when the MCP server restarts. Pass `force_refresh: true` to `get_rows` to discard the rows cache for one tableId; re-syncing a table also invalidates its cached rows.
 
 - `schemaCache`: `tableId → schema`. Populated by `sync_table` / `sync_workbook`, and lazily by `get_rows` when called with a `url` instead of a `tableId`.
-- `rowsCache`: `tableId → Map<viewId, { headers, csvRows, totalRows, rowIdsPromise, syncedAt }>`. Populated on first `get_rows` call. Keyed per-view because different saved views return different row sets and orderings — the index → rowId mapping has to be per-view too. `rowIdsPromise` lazy-loads the bulk `/records` fetch on first need and is shared across concurrent matches. See [Row lookup](#2-row-lookup-is-a-csv-bulk-read--lazy-rowid-resolution) above for how the CSV/rowId split works.
+- `rowsCache`: `tableId → Map<viewId, { headers, csvRows, totalRows, syncedAt }>`. Populated on the first no-query `get_rows` call (or on `force_refresh`). Keyed per-view because different saved views return different row sets and orderings. The query path doesn't read or write this cache — it goes straight to Clay's server-side search. See [Row lookup](#2-row-lookup-splits-by-mode-server-side-search-for-queries-csv-bulk-for-samples) above.
 
 ---
 
