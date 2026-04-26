@@ -33,6 +33,9 @@ import { analyzeRowStatuses, formatRecord, parseCsv, searchCsvRows } from './src
 const schemaCache = new Map(); // tableId -> schema
 const rowsCache   = new Map(); // tableId -> Map<viewId, { viewId, headers, csvRows, totalRows, rowIdsByIndex, syncedAt }>
 
+// MCP transport caps a single tool result at ~1MB. Leave headroom for protocol overhead.
+const MCP_RESPONSE_MAX_BYTES = 900_000;
+
 function parseClayUrl(url) {
   if (!url) throw new Error('No URL provided. Pass a Clay table or workbook URL.');
   const workbookMatch = url.match(/workbooks\/(wb_[a-zA-Z0-9]+)/);
@@ -334,7 +337,9 @@ USE WHEN: URL contains /workbooks/ (even if it also contains /tables/).
 DON'T USE WHEN: URL is a single-table URL with no workbook segment → use sync_table.
 RETURNS: JSON object — { workbookId, tables: [<schema>...], errors: [{ tableId, message }], externalSubroutines: [{ tableId, schema, invokedBy }] }.
 
-Cross-table connections (route-row, lookups) are not pre-computed — derive them from typeSettings on each schema. After this call, every tableId in the result is cached and usable by get_rows / get_record / get_credits / get_errors.`,
+Cross-table connections (route-row, lookups) are not pre-computed — derive them from typeSettings on each schema. After this call, every tableId in the result is cached and usable by get_rows / get_record / get_credits / get_errors.
+
+MANIFEST FALLBACK: when the full payload would exceed the MCP transport budget (~1MB), the response degrades to manifest mode: { workbookId, mode: "manifest", reason, nextStep, tables: [{ tableId, tableName, rowCount, fieldCount, estimatedBytes }], errors, externalSubroutines: [{ tableId, tableName, fieldCount, estimatedBytes, invokedBy }], oversizedTableIds? }. Every schema was still fetched and is cached server-side, so the follow-up flow is: pick the tables you actually need, call sync_table per URL — those are cache hits, no extra Clay calls. If oversizedTableIds is non-empty, those individual tables are too large for any single response and may also fail sync_table — flag to the user.`,
   { url: z.string().describe('Clay workbook URL, e.g. https://app.clay.com/workspaces/4515/workbooks/wb_xxx/all-tables') },
   async ({ url }) => {
     const { workbookId } = parseClayUrl(url);
@@ -401,12 +406,52 @@ Cross-table connections (route-row, lookups) are not pre-computed — derive the
         }
       }
 
+      const externalSubroutines = Array.from(externalById.values());
+      const fullJson = JSON.stringify({
+        workbookId,
+        tables: schemas,
+        errors,
+        externalSubroutines
+      }, null, 2);
+
+      if (fullJson.length <= MCP_RESPONSE_MAX_BYTES) {
+        return { content: [{ type: 'text', text: fullJson }] };
+      }
+
+      // Manifest fallback: full schemas exceed the MCP response budget.
+      // Schemas remain in schemaCache, so subsequent sync_table calls per tableId are cache hits.
+      const tableManifest = schemas.map(s => ({
+        tableId:        s.tableId,
+        tableName:      s.tableName,
+        rowCount:       s.rowCount,
+        fieldCount:     s.fieldCount,
+        estimatedBytes: JSON.stringify(s).length
+      }));
+
+      const externalManifest = externalSubroutines.map(e => ({
+        tableId:        e.tableId,
+        tableName:      e.schema?.tableName ?? null,
+        rowCount:       e.schema?.rowCount ?? null,
+        fieldCount:     e.schema?.fieldCount ?? null,
+        estimatedBytes: e.schema ? JSON.stringify(e.schema).length : 0,
+        invokedBy:      e.invokedBy,
+        error:          e.error
+      }));
+
+      const oversizedTableIds = [...tableManifest, ...externalManifest]
+        .filter(t => t.estimatedBytes > MCP_RESPONSE_MAX_BYTES)
+        .map(t => t.tableId);
+
       return {
         content: [{ type: 'text', text: JSON.stringify({
           workbookId,
-          tables: schemas,
+          mode:          'manifest',
+          reason:        `Full payload (${fullJson.length} bytes) exceeds MCP transport budget of ${MCP_RESPONSE_MAX_BYTES} bytes. Schemas were fetched and are cached server-side.`,
+          nextStep:      'Call sync_table per table URL (or use the cached tableId via get_rows / get_record / get_credits / get_errors). Cached schemas are returned without an extra Clay round-trip.',
+          oversizedTableIds: oversizedTableIds.length ? oversizedTableIds : undefined,
+          tables:        tableManifest,
           errors,
-          externalSubroutines: Array.from(externalById.values())
+          externalSubroutines: externalManifest
         }, null, 2) }]
       };
     } catch (err) {
