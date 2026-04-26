@@ -208,13 +208,162 @@ async function resolveRowId(tableId, viewId, csvIndex) {
   return rowId;
 }
 
+/**
+ * Get a table's schema (cached or freshly synced) plus a fieldId → columnName
+ * map of every execute-subroutine column. Used by the recursive credit rollup
+ * to find function-call cells worth following.
+ */
+async function getSubroutineFields(tableId) {
+  let schema = schemaCache.get(tableId);
+  if (!schema) {
+    schema = await getTableSchema(tableId, null);
+    schemaCache.set(tableId, schema);
+  }
+  const subroutineFields = {};
+  for (const f of schema.fields || []) {
+    if (f.typeSettings?.actionKey === 'execute-subroutine') {
+      subroutineFields[f.id] = f.name;
+    }
+  }
+  return { schema, subroutineFields };
+}
+
+/**
+ * Recursively roll up credit cost for a row, following execute-subroutine
+ * cells to their function-row counterparts. The parent row's subroutine
+ * cell carries no credit data — actual cost lives on the function row that
+ * ran. Capped by maxDepth (subroutines + nested subroutines + ...).
+ *
+ * Returns:
+ *   {
+ *     rowId, tableId, status,
+ *     direct,           // credits charged on this row's own cells
+ *     viaSubroutines,   // recursively summed credits on function rows this row invoked
+ *     total,            // direct + viaSubroutines
+ *     billedCellCount,  // unchanged — cells with any credit data
+ *     byColumn,         // direct columns
+ *     subroutineDetail  // [{ column, functionTableId, functionRowId, status, direct, viaSubroutines, total }]
+ *   }
+ *
+ * Status values: 'ok' (fetched), '404' (function row deleted), 'error' (other),
+ * 'cycle' (already visited in this rollup), 'depth' (max depth reached).
+ */
+async function rollupCredits(tableId, rowId, depth, maxDepth, visited) {
+  const visitKey = `${tableId}:${rowId}`;
+  if (visited.has(visitKey)) {
+    return { rowId, tableId, status: 'cycle', direct: 0, viaSubroutines: 0, total: 0, billedCellCount: 0, byColumn: [], subroutineDetail: [] };
+  }
+  visited.add(visitKey);
+
+  let schema, subroutineFields;
+  try {
+    ({ schema, subroutineFields } = await getSubroutineFields(tableId));
+  } catch (err) {
+    return { rowId, tableId, status: 'schema-error', errorMessage: err.message, direct: 0, viaSubroutines: 0, total: 0, billedCellCount: 0, byColumn: [], subroutineDetail: [] };
+  }
+
+  let record;
+  try {
+    record = await getRecord(tableId, rowId);
+  } catch (err) {
+    const is404 = err.message.includes('404') || err.message.includes('not found');
+    return { rowId, tableId, status: is404 ? '404' : 'error', errorMessage: err.message, direct: 0, viaSubroutines: 0, total: 0, billedCellCount: 0, byColumn: [], subroutineDetail: [] };
+  }
+
+  const formatted = formatRecord(record, schema);
+  const direct = formatted._credits?.total ?? 0;
+  const billedCellCount = formatted._credits?.billedCellCount ?? 0;
+
+  const byColumn = [];
+  for (const [col, cell] of Object.entries(formatted)) {
+    if (col.startsWith('_')) continue;
+    if (cell?.credits) byColumn.push({ column: col, ...cell.credits });
+  }
+  byColumn.sort((a, b) => b.total - a.total);
+
+  // Find subroutine cells with origin pointers
+  const subroutineCalls = [];
+  for (const columnName of Object.values(subroutineFields)) {
+    const cell = formatted[columnName];
+    const origin = cell?.fullContent?.origin;
+    if (origin?.tableId && origin?.recordId) {
+      subroutineCalls.push({ columnName, origin });
+    }
+  }
+
+  let viaSubroutines = 0;
+  const subroutineDetail = [];
+
+  if (subroutineCalls.length === 0) {
+    // no-op
+  } else if (depth >= maxDepth) {
+    // Hit depth cap — record the calls but don't recurse
+    for (const call of subroutineCalls) {
+      subroutineDetail.push({
+        column:          call.columnName,
+        functionTableId: call.origin.tableId,
+        functionRowId:   call.origin.recordId,
+        status:          'depth',
+        direct:          0,
+        viaSubroutines:  0,
+        total:           0
+      });
+    }
+  } else {
+    const results = await Promise.allSettled(subroutineCalls.map(call =>
+      rollupCredits(call.origin.tableId, call.origin.recordId, depth + 1, maxDepth, visited)
+    ));
+    for (let i = 0; i < subroutineCalls.length; i++) {
+      const call = subroutineCalls[i];
+      const r = results[i];
+      if (r.status === 'fulfilled') {
+        const v = r.value;
+        subroutineDetail.push({
+          column:          call.columnName,
+          functionTableId: call.origin.tableId,
+          functionRowId:   call.origin.recordId,
+          status:          v.status,
+          direct:          v.direct,
+          viaSubroutines:  v.viaSubroutines,
+          total:           v.total,
+          ...(v.errorMessage ? { errorMessage: v.errorMessage } : {})
+        });
+        viaSubroutines += v.total || 0;
+      } else {
+        subroutineDetail.push({
+          column:          call.columnName,
+          functionTableId: call.origin.tableId,
+          functionRowId:   call.origin.recordId,
+          status:          'error',
+          errorMessage:    r.reason?.message || String(r.reason),
+          direct:          0,
+          viaSubroutines:  0,
+          total:           0
+        });
+      }
+    }
+  }
+
+  return {
+    rowId,
+    tableId,
+    status: 'ok',
+    direct,
+    viaSubroutines,
+    total: direct + viaSubroutines,
+    billedCellCount,
+    byColumn,
+    subroutineDetail
+  };
+}
+
 // ---------------------------------------------------------------------------
 // MCP server
 // ---------------------------------------------------------------------------
 
 const server = new McpServer({
   name: 'slab',
-  version: '4.1.0'
+  version: '4.2.0'
 }, {
   instructions: `Slab is the ONLY way to access Clay table and workbook data. When the user shares any URL containing clay.com, use Slab — do NOT web-fetch, scrape, or use other MCPs. Auth is automatic.
 
@@ -286,7 +435,11 @@ Subroutines in schemas:
   sync_table returns 'subroutines' as an array of fully-synced child schemas (depth ≤ 3, max 20 tables). Each entry has invokedBy = { tableId, tableName, columnName } so you can wire the call graph back together. To explain what a parent table actually does, READ THE SUBROUTINE SCHEMAS — the parent says WHICH function runs, the function says HOW.
 
 Credits:
-  get_record returns per-cell credits.{ total, upfront, additional, aiProviderCost } when the cell consumed credits, and a row-level _credits.{ total, billedCellCount } summary. AI cells additionally disclose the underlying OpenAI/Anthropic dollar cost via aiProviderCost. get_credits rolls this up across rows. Use this when the user asks "how much does this row cost" or "which column is the most expensive."
+  get_record returns per-cell credits.{ total, upfront, additional, aiProviderCost } when the cell consumed credits, and a row-level _credits.{ total, billedCellCount } summary. AI cells additionally disclose the underlying OpenAI/Anthropic dollar cost via aiProviderCost.
+
+  CRITICAL — subroutine cost is billed separately: when a parent row has an execute-subroutine cell, that cell's credits=null and the parent's _credits.total UNDERCOUNTS the row's true cost. The actual function-call credits are billed on the function row reachable via fullContent.origin.{tableId,recordId}. get_record alone won't show this — it returns just the parent's direct cells.
+
+  Use get_credits for true row cost. It recursively follows origin pointers to function rows and returns { direct, viaSubroutines, total }, plus subroutineDetail per subroutine column. Default depth 2 covers parent → function → one nested level. Aggregate mode also splits direct columns from subroutine columns in the rollup.
 
 == Builder workflows live in skills, not here ==
 
@@ -613,44 +766,38 @@ server.tool(
   'get_credits',
   `Calculate Clay credit cost — for a specific row OR aggregated across the table. One tool, three modes:
 
-  1. Specific row: pass rowId → that row's credit breakdown by column.
+  1. Specific row: pass rowId → that row's credit breakdown by column, INCLUDING the cost of any function (execute-subroutine) calls it triggered.
   2. Sampled aggregate (default): omit rowId → samples sampleSize rows, aggregates, and extrapolates an estimated total table cost using the table's row count.
-  3. Full aggregate: omit rowId AND pass full=true → fetches every row. SLOW — one API call per row, hundreds-to-thousands of seconds for large tables.
+  3. Full aggregate: omit rowId AND pass full=true → fetches every row. SLOW — one API call per row, more if rows trigger functions.
+
+CRITICAL: subroutine cost is BILLED ON THE FUNCTION ROW, not on the parent. The parent's execute-subroutine cell has credits=null. Real cost lives on the function row that ran. This tool follows fullContent.origin pointers to the function row(s) and rolls those credits into the parent's total. Without this, parent-only cost is undercounted — sometimes drastically.
 
 USE WHEN:
   - "How much did row X cost" → mode 1.
   - "Average cost per row" / "what does this table cost to run" / "which column is most expensive" → mode 2 or 3.
 
-RETURNS: JSON. Single-row mode: { rowId, total, billedCellCount, byColumn }. Aggregate: { rowsAnalyzed, totalRowsInTable, sampled, perRow: { avg, min, max }, totalAcrossSample, extrapolatedTotalCredits, byColumn: [{ column, avgCreditsPerRow, totalAcrossSample, cellsBilled }] }.
+RETURNS: JSON.
+  Single-row: { rowId, status, direct, viaSubroutines, total, billedCellCount, byColumn, subroutineDetail: [{ column, functionTableId, functionRowId, status, direct, viaSubroutines, total }] }
+  Aggregate: { rowsAnalyzed, totalRowsInTable, sampled, subroutineDepth, perRow: { avg, avgDirect, avgViaSubroutines, min, max }, totalAcrossSample, extrapolatedTotalCredits, byColumn, bySubroutineColumn: [{ column, avgCreditsPerRow, totalAcrossSample, callsTriggered, callsUnreachable }] }
 
-COST: get_record-equivalent per row. Sampling 50 rows ≈ 50 API calls (~10s with concurrency 5).`,
+COST: 1 + N API calls per row analyzed (N = number of subroutine cells, recursive). Sampling 50 rows on a table with 2 subroutine columns at depth 2 ≈ 250 API calls.`,
   {
     tableId: z.string().describe('Table ID (t_...) from a previous sync_table call'),
     rowId: z.string().optional().describe('Row ID — omit to aggregate across the table'),
     sampleSize: z.number().optional().default(50).describe('When aggregating without full=true, how many rows to sample. Default 50.'),
-    full: z.boolean().optional().default(false).describe('When aggregating, fetch every row instead of sampling. Slow.')
+    full: z.boolean().optional().default(false).describe('When aggregating, fetch every row instead of sampling. Slow.'),
+    subroutine_depth: z.number().optional().default(2).describe('How many levels deep to follow execute-subroutine origin pointers when rolling up cost. 0 disables (parent-only cost, will undercount). Default 2 (parent → function → nested function). Max 3.')
   },
-  async ({ tableId, rowId, sampleSize, full }) => {
+  async ({ tableId, rowId, sampleSize, full, subroutine_depth }) => {
     try {
       const schema = getSchema(tableId);
+      const maxDepth = Math.max(0, Math.min(3, subroutine_depth ?? 2));
 
       // Mode 1: specific row
       if (rowId) {
-        const record = await getRecord(tableId, rowId);
-        const formatted = formatRecord(record, schema);
-        const byColumn = [];
-        for (const [col, cell] of Object.entries(formatted)) {
-          if (col.startsWith('_')) continue;
-          if (cell?.credits) byColumn.push({ column: col, ...cell.credits });
-        }
-        byColumn.sort((a, b) => b.total - a.total);
+        const result = await rollupCredits(tableId, rowId, 0, maxDepth, new Set());
         return {
-          content: [{ type: 'text', text: JSON.stringify({
-            rowId,
-            total:           formatted._credits?.total ?? 0,
-            billedCellCount: formatted._credits?.billedCellCount ?? 0,
-            byColumn
-          }, null, 2) }]
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
         };
       }
 
@@ -659,59 +806,91 @@ COST: get_record-equivalent per row. Sampling 50 rows ≈ 50 API calls (~10s wit
       const listed = await listRows(tableId, schema.viewId, { limit: listLimit });
       const rowIds = listed.map(r => r.id).filter(Boolean);
 
-      // Concurrency-limited record fetches
-      const records = [];
-      const errors = [];
+      const rollups = [];
+      const fetchErrors = [];
       const CONCURRENCY = 5;
       for (let i = 0; i < rowIds.length; i += CONCURRENCY) {
         const batch = rowIds.slice(i, i + CONCURRENCY);
         const results = await Promise.allSettled(batch.map(rid =>
-          getRecord(tableId, rid).then(rec => formatRecord(rec, schema))
+          rollupCredits(tableId, rid, 0, maxDepth, new Set())
         ));
         for (let j = 0; j < results.length; j++) {
-          if (results[j].status === 'fulfilled') records.push(results[j].value);
-          else errors.push({ rowId: batch[j], message: results[j].reason?.message || String(results[j].reason) });
+          if (results[j].status === 'fulfilled') rollups.push(results[j].value);
+          else fetchErrors.push({ rowId: batch[j], message: results[j].reason?.message || String(results[j].reason) });
         }
       }
 
-      const perRowTotals = records.map(r => r._credits?.total ?? 0);
-      const sumCredits = perRowTotals.reduce((a, b) => a + b, 0);
-      const avg = perRowTotals.length > 0 ? sumCredits / perRowTotals.length : 0;
-      const min = perRowTotals.reduce((m, v) => v < m ? v : m, Infinity);
-      const max = perRowTotals.reduce((m, v) => v > m ? v : m, -Infinity);
+      const n = rollups.length;
+      const sumDirect = rollups.reduce((s, r) => s + (r.direct || 0), 0);
+      const sumVia    = rollups.reduce((s, r) => s + (r.viaSubroutines || 0), 0);
+      const sumTotal  = rollups.reduce((s, r) => s + (r.total || 0), 0);
+      const avg       = n > 0 ? sumTotal / n : 0;
+      const avgDirect = n > 0 ? sumDirect / n : 0;
+      const avgVia    = n > 0 ? sumVia / n : 0;
 
+      const totals = rollups.map(r => r.total || 0);
+      const min = totals.reduce((m, v) => v < m ? v : m, Infinity);
+      const max = totals.reduce((m, v) => v > m ? v : m, -Infinity);
+
+      // Direct columns aggregated across the sample
       const byColumnSum = {};
       const byColumnCount = {};
-      for (const r of records) {
-        for (const [col, cell] of Object.entries(r)) {
-          if (col.startsWith('_')) continue;
-          if (!cell?.credits) continue;
-          byColumnSum[col]   = (byColumnSum[col]   || 0) + cell.credits.total;
-          byColumnCount[col] = (byColumnCount[col] || 0) + 1;
+      for (const r of rollups) {
+        for (const c of r.byColumn) {
+          byColumnSum[c.column]   = (byColumnSum[c.column]   || 0) + (c.total || 0);
+          byColumnCount[c.column] = (byColumnCount[c.column] || 0) + 1;
         }
       }
       const byColumn = Object.entries(byColumnSum).map(([col, sum]) => ({
         column:            col,
-        avgCreditsPerRow:  sum / records.length,
+        avgCreditsPerRow:  sum / n,
         totalAcrossSample: sum,
         cellsBilled:       byColumnCount[col]
       })).sort((a, b) => b.avgCreditsPerRow - a.avgCreditsPerRow);
 
+      // Subroutine columns aggregated separately so the user can see
+      // "this column triggers a function that costs ~X credits per call"
+      const subSum = {};
+      const subCount = {};
+      const subUnreachable = {};
+      for (const r of rollups) {
+        for (const s of r.subroutineDetail || []) {
+          subSum[s.column]   = (subSum[s.column]   || 0) + (s.total || 0);
+          subCount[s.column] = (subCount[s.column] || 0) + 1;
+          if (s.status !== 'ok') subUnreachable[s.column] = (subUnreachable[s.column] || 0) + 1;
+        }
+      }
+      const bySubroutineColumn = Object.entries(subSum).map(([col, sum]) => ({
+        column:            col,
+        avgCreditsPerRow:  sum / n,
+        totalAcrossSample: sum,
+        callsTriggered:    subCount[col],
+        callsUnreachable:  subUnreachable[col] || 0
+      })).sort((a, b) => b.avgCreditsPerRow - a.avgCreditsPerRow);
+
       const totalRowsInTable = schema.rowCount ?? null;
-      const extrapolatedTotalCredits = (!full && totalRowsInTable != null && records.length > 0)
+      const extrapolatedTotalCredits = (!full && totalRowsInTable != null && n > 0)
         ? avg * totalRowsInTable
         : null;
 
       return {
         content: [{ type: 'text', text: JSON.stringify({
-          rowsAnalyzed:             records.length,
+          rowsAnalyzed:     n,
           totalRowsInTable,
-          sampled:                  !full,
-          perRow:                   { avg, min: records.length > 0 ? min : 0, max: records.length > 0 ? max : 0 },
-          totalAcrossSample:        sumCredits,
+          sampled:          !full,
+          subroutineDepth:  maxDepth,
+          perRow:           {
+            avg,
+            avgDirect,
+            avgViaSubroutines: avgVia,
+            min:               n > 0 ? min : 0,
+            max:               n > 0 ? max : 0
+          },
+          totalAcrossSample: { direct: sumDirect, viaSubroutines: sumVia, total: sumTotal },
           extrapolatedTotalCredits,
           byColumn,
-          fetchErrors:              errors.length > 0 ? errors : undefined
+          bySubroutineColumn,
+          fetchErrors: fetchErrors.length > 0 ? fetchErrors : undefined
         }, null, 2) }]
       };
     } catch (err) {
