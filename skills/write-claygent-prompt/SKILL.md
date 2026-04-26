@@ -644,7 +644,7 @@ Before outputting, verify:
 
 ---
 
-## SECTION 8: ACTION KEYS, MODELS, AND SCHEMA REFERENCE
+## SECTION 8: ACTION KEYS AND SCHEMA REFERENCE
 
 ### Action Keys
 
@@ -653,15 +653,6 @@ Before outputting, verify:
 | `use-ai` with `useCase="claygent"` | Web Research | `?.response` (string) — or direct field access if structured |
 | `use-ai` with `useCase="use-ai"` | Content Manipulation | Direct field access — `?.fieldName` |
 | `claygent` (legacy) | Web Research | `?.result` or direct field access |
-
-### Model Cost Ladder (Cheapest → Most Capable)
-
-- **`clay-argon`** — lightweight classification, domain status check, binary yes/no. Cheapest.
-- **`gpt-4o-mini` / `clay-neon`** — structured JSON output, article summarization, mid-complexity reasoning.
-- **`gpt-4o` / `gpt-4.1`** — open-ended multilingual web research, disambiguation, judgment tasks across unpredictable sources.
-- **`gpt-5`** — deep reasoning, multi-step inference, when the task requires planning over evidence.
-
-**Match model to task:** cheaper for well-scoped classification, more capable for synthesis across unpredictable sources. Don't pay for `gpt-4o` on a binary "is this a domain?" check.
 
 ### Where Prompts Live in Clay's Schema
 
@@ -969,5 +960,5 @@ This skill encodes the prompt-engineering conventions used across production Cla
 - The empty-string null policy and the requirement to state it 3+ times.
 - The forbidden-strings list and the failure modes that motivate it.
 - The "logic summary first, then write" workflow gate.
-- The action key + model selection ladder.
+- The action keys to use for each mode.
 - Where prompts live in Clay's schema when you're reading or rewriting an existing one.
