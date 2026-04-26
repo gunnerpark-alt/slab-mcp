@@ -2,7 +2,7 @@
 
 **MCP server for analyzing Clay tables** — schema, rows, errors, credit cost, and enrichment debugging, via the same internal Clay API the frontend uses.
 
-Connects Claude (Desktop, Code, or any MCP client) to Clay. Share any `app.clay.com` URL and Claude can read the schema, pull rows, trace enrichment failures end-to-end through Clay Functions (subroutines), see exactly how many credits each cell consumed, and lean on a 13-topic knowledge base of Clay platform patterns when writing formulas or prompts.
+Connects Claude (Desktop, Code, or any MCP client) to Clay. Share any `app.clay.com` URL and Claude can read the schema, pull rows, trace enrichment failures end-to-end through Clay Functions (subroutines), and see exactly how many credits each cell consumed. Two installable Claude Code skills (`write-clay-formula`, `write-claygent-prompt`) cover the writing workflows.
 
 ---
 
@@ -12,7 +12,7 @@ Connects Claude (Desktop, Code, or any MCP client) to Clay. Share any `app.clay.
 - **Trace why an enrichment failed** — find a row by name, get the raw provider response, follow each subroutine pointer into the child row that actually ran, recurse up to 3 levels.
 - **See per-row credit cost** — every cell's basic credits, action-execution credits, post-2026 pricing, and underlying OpenAI/Anthropic dollar cost for AI columns. Roll-up total per row.
 - **Spot what's broken across a table** — per-column status counts (success / error / has-not-run / queued), error message frequencies, fill rate.
-- **Improve formulas and prompts** — 13 bundled Clay platform reference docs covering formula syntax, Claygent patterns, output contracts, waterfall design, provider gotchas.
+- **Write or fix formulas and Claygent prompts** — two installable Claude Code skills (`write-clay-formula`, `write-claygent-prompt`) walk the workflow: gather inputs, pick the mode, apply the section structure and casing conventions, validate against the production-bug checklist.
 
 ---
 
@@ -118,9 +118,7 @@ node /absolute/path/to/slab-mcp/index.js
 
 ## Tools
 
-slab exposes eight tools across two groups.
-
-**Data tools** — what a table IS and what's IN it:
+slab exposes seven data tools — what a table IS and what's IN it. Builder workflows (writing formulas, writing Claygent prompts) live in [skills](#skills) instead.
 
 | Tool | Use when | Returns |
 |---|---|---|
@@ -132,13 +130,7 @@ slab exposes eight tools across two groups.
 | `get_credits` | "How much did row X cost" / "average credit cost per row" / "which column is most expensive" | One tool, three modes. With `rowId`: that row's per-column breakdown. Without: samples N rows (default 50), aggregates, and extrapolates a total table cost using the schema's row count. Pass `full: true` to scan every row instead of sampling. |
 | `get_errors` | Broad "what's failing" / health check | `{ rowsAnalyzed, columns: [{ success, error, hasNotRun, queued, total, fillPct, topErrors }] }`. Counts only — Claude derives "broken" vs "gated by run condition" from the schema. |
 
-**Knowledge tool** — what GOOD looks like:
-
-| Tool | Use when | Returns |
-|---|---|---|
-| `read_kb` | User asks to improve / fix / rewrite / review / audit / debug / design / optimize anything in a Clay table | Full markdown of one of 13 Clay platform reference docs. |
-
-The MCP server's `instructions` field carries the full decision tree (which tool when, when to call `read_kb` alongside, how to follow subroutine pointers) — Claude sees it on every conversation that uses any slab tool.
+The MCP server's `instructions` field carries the full decision tree (which tool when, the cost rule of thumb between cheap CSV reads and expensive nested fetches, how to follow subroutine pointers, how to interpret credit fields) — Claude sees it on every conversation that uses any slab tool.
 
 ---
 
@@ -160,7 +152,7 @@ src/clay-api.js          Clay internal API client — endpoint helpers + schema 
 src/auth.js              Credential resolver (Chrome → ~/.slab/config.json fallback)
 src/cookie-reader.js     Decrypts Chrome's on-disk cookie DB via macOS Keychain
 src/row-utils.js         CSV parsing, status counting, record projection (token-cheap shape)
-kb/                      13 bundled Clay platform reference docs served by read_kb
+skills/                  Installable Claude Code skills — write-clay-formula, write-claygent-prompt
 ```
 
 Four things are worth understanding deeper because they're what makes slab actually useful for "explain this table" / "why did X fail" questions, beyond just listing endpoints:
@@ -220,29 +212,47 @@ Both caches live in-process and vanish when the MCP server restarts. Pass `force
 
 ---
 
-## Knowledge base
+## Skills
 
-The 13 reference docs ship with the repo under [`kb/`](kb/) — no external setup, no symlink. `read_kb` reads from that bundled directory directly.
+slab ships two installable Claude Code skills under [`skills/`](skills/). They're separate from the MCP server — the MCP gives Claude *data tools*; the skills give Claude *builder workflows*.
 
-| Topic | What it covers |
-|---|---|
-| `formula-syntax` | 8 critical Clay formula syntax rules, banned JS features, working substitutes |
-| `formula-patterns` | Lodash/Moment reference, scoring, array manipulation, real-world examples |
-| `formula-bugs` | Confirmed Clay formula bugs (Object.assign failure, forward-reference cascades) |
-| `prompt-anatomy` | The 8-section skeleton for every Clay AI prompt |
-| `output-contracts` | JSON schemas, forbidden strings (`N/A`, `Unknown`), null policies, camelCase vs snake_case |
-| `claygent` | Claygent vs Use AI, 12-section structure, search strategy, failure modes |
-| `pipeline-stages` | Standard pipeline (input → identity → enrichment → score → export), multi-table patterns |
-| `orchestration` | 15 advanced workarounds (fan-out, sparse data gates, AI-generated SOQL, screenshot+vision) |
-| `builder-patterns` | Formula vs action columns, cell size, batching, tables-as-queues |
-| `waterfalls` | Waterfall structure, cumulative exclusion gates, email/phone/domain waterfall types |
-| `providers` | 40+ providers with action keys, credit costs, output paths, provider-specific gotchas |
-| `debugging` | Diagnostic formulas, yellow triangles, waterfall stalls, race conditions |
-| `data-model` | Column types, 8KB/200KB limits, schema.json structure, provider output access paths |
+| Skill | Triggers on | What it does |
+|---|---|---|
+| [`write-clay-formula`](skills/write-clay-formula/SKILL.md) | "write / fix / debug / review a Clay formula" | Walks the formula-generation workflow: gather inputs → check sandbox traps → write → validate. Encodes the 10 critical syntax rules (no `return`, no template literals, optional chaining everywhere, lookup `.records` / filter `.filteredArray` wrappers, `Number()` for scoring), 30 worked patterns, and the confirmed production bugs (Object.assign on enrichment objects, Audiences round-trip, waterfall context-change). |
+| [`write-claygent-prompt`](skills/write-claygent-prompt/SKILL.md) | "write / fix / review a Claygent or Use AI prompt" | Picks the mode first — web research (12 mandatory sections, internet access) vs content manipulation (10 sections, no internet). Encodes the section structure, casing conventions (snake_case inputs, camelCase outputs, ALL CAPS filler variables), forbidden-strings list, the empty-string null policy with 3+ reinforcement, anti-hallucination guardrails, and the model + action-key cost ladder. |
 
-The same content is also exposed as MCP resources (`clay-kb://formulas/syntax.md`, etc.) for clients that support resource reads.
+### Why skills, not knowledge-base docs
 
-To refresh the bundled docs, edit the markdown files directly under `kb/` and commit. The server reads from disk at call time — no build step, no restart required (though an MCP reconnect is needed if the server is already running).
+Earlier versions of slab shipped a `kb/` directory with reference markdown for formulas, prompts, providers, debugging, etc. — pulled in via a `read_kb` MCP tool. That's gone. The skills replace it.
+
+Reference docs let Claude *look things up after it's already chosen what to do*. Skills shape the *order of operations* before any choice is made — they're a workflow with an embedded constraint set, not a cookbook. For "write a Clay formula" or "write a Claygent prompt," the workflow is the leverage. Reference material that doesn't change the order Claude does things in is mostly bulk Claude already knows from training.
+
+### Installing the skills
+
+The skills are Claude Code-specific. Claude Desktop and direct API users don't get this scaffolding; they fall back on the MCP server's `instructions` field for tool selection only.
+
+For per-user install:
+
+```bash
+mkdir -p ~/.claude/skills
+cp -r skills/write-clay-formula     ~/.claude/skills/
+cp -r skills/write-claygent-prompt  ~/.claude/skills/
+```
+
+Or symlink so updates from `git pull` propagate without re-copying:
+
+```bash
+ln -s "$(pwd)/skills/write-clay-formula"    ~/.claude/skills/write-clay-formula
+ln -s "$(pwd)/skills/write-claygent-prompt" ~/.claude/skills/write-claygent-prompt
+```
+
+For project-scoped install, drop them under `.claude/skills/` in the project root instead.
+
+Verify with `/skills` in Claude Code.
+
+### Editing the skills
+
+Edit the SKILL.md file directly. Skills are loaded fresh on each invocation — no build step, no MCP reconnect needed. PRs welcome.
 
 ---
 
@@ -281,10 +291,18 @@ get_credits(tableId)                  # samples 50 rows, extrapolates
 **"Help me rewrite the Claygent prompt in column X"**
 ```
 sync_table (schema shows current prompt text in full)
-read_kb("prompt-anatomy")
-read_kb("claygent")
-read_kb("output-contracts")
-  → Claude returns a rewritten prompt following the 12-section structure
+  → write-claygent-prompt skill auto-triggers
+  → skill picks mode (web research vs content manipulation)
+  → skill walks the 12- or 10-section workflow
+  → returns a rewritten prompt with proper casing, null policy, examples
+```
+
+**"Fix this formula"**
+```
+sync_table (schema shows current formula text)
+  → write-clay-formula skill auto-triggers
+  → skill checks sandbox traps, optional-chaining, lookup column wrapping
+  → returns a corrected formula with the 10 syntax rules satisfied
 ```
 
 **"Which columns are broken across this table?"**

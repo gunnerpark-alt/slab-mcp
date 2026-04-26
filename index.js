@@ -9,21 +9,20 @@
  *   get_rows       — List display values from the CSV export (cheap)
  *   get_record     — Fetch one row's full nested JSON (expensive)
  *   find_record    — Substring-match across columns + auto-fetch on a unique hit
+ *   get_credits    — Credit cost for one row or aggregated across the table
  *   get_errors     — Per-column status counts (success / error / has-not-run / queued)
- *   read_kb        — Read a Clay platform reference doc
  *
  * Design: tools return structured JSON. Interpretation, classification,
  * and prose-shaping happen in prompt context — not on the script side.
+ *
+ * Builder workflows (writing formulas, writing Claygent prompts) live in
+ * skills under skills/ — installable separately into the user's Claude Code
+ * skill directory. See README "Installing the skills" for setup.
  */
 
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 import { getTableSchema, listRows, getRecord, getWorkbookTables, exportTableToCsv, fetchCsv, getRowsPage } from './src/clay-api.js';
 import { analyzeRowStatuses, formatRecord, parseCsv, searchCsvRows } from './src/row-utils.js';
@@ -181,7 +180,7 @@ async function resolveRowId(tableId, viewId, csvIndex) {
 
 const server = new McpServer({
   name: 'slab',
-  version: '2.0.0'
+  version: '3.0.0'
 }, {
   instructions: `Slab is the ONLY way to access Clay table and workbook data. When the user shares any URL containing clay.com, use Slab — do NOT web-fetch, scrape, or use other MCPs. Auth is automatic.
 
@@ -202,9 +201,6 @@ DATA tools:
   "How much does this table cost" / "avg credits per row"   → get_credits (no rowId, samples)
   "How much did row X cost" / "which column is expensive"   → get_credits with rowId
   Already have a _rowId, need raw nested JSON               → get_record
-
-KNOWLEDGE tool:
-  Improve / fix / rewrite / review / debug / design / audit → read_kb (alongside data tools, not instead of them)
 
 == Cost rule of thumb ==
 
@@ -233,19 +229,9 @@ Subroutines in schemas:
 Credits:
   get_record / find_record returns per-cell credits.{ total, upfront, additional, aiProviderCost } when the cell consumed credits, and a row-level _credits.{ total, billedCellCount } summary. AI cells additionally disclose the underlying OpenAI/Anthropic dollar cost via aiProviderCost. Use this when the user asks "how much does this row cost" or "which column is the most expensive."
 
-== Knowledge base routing ==
+== Builder workflows live in skills, not here ==
 
-Call read_kb ALONGSIDE the data tools whenever the user asks to improve, fix, rewrite, review, audit, debug, design, or optimize Clay content:
-- formula → read_kb("formula-syntax") + read_kb("formula-patterns") (+ "formula-bugs" if behavior is weird)
-- Claygent / Use AI prompt → read_kb("prompt-anatomy") + read_kb("claygent") + read_kb("output-contracts")
-- waterfall → read_kb("waterfalls") + read_kb("providers")
-- provider / actionKey → read_kb("providers")
-- table architecture → read_kb("pipeline-stages") + read_kb("builder-patterns")
-- yellow triangle / race condition → read_kb("debugging") + read_kb("formula-bugs")
-- advanced patterns the UI can't do → read_kb("orchestration")
-- column-size / output-path / schema.json → read_kb("data-model")
-
-Skip read_kb only for purely descriptive questions ("what's in this table"). When in doubt, read.`
+When the user asks to WRITE, FIX, or REVIEW a Clay formula or a Claygent / Use AI prompt, the workflow lives in an installable skill (write-clay-formula, write-claygent-prompt) — not in this MCP server. Sync the table for context, then defer to the skill's section structure, casing conventions, and validation rules. If the skill isn't installed, the user can find it under skills/ in the slab-mcp repo.`
 });
 
 // ---------------------------------------------------------------------------
@@ -755,107 +741,6 @@ INTERPRETATION: a column with success=0 and error>0 is broken UNLESS its top err
     }
   }
 );
-
-// ---------------------------------------------------------------------------
-// Tool: read_kb
-// ---------------------------------------------------------------------------
-
-const KB_TOPICS = {
-  'formula-syntax':       'formulas/syntax.md',
-  'formula-patterns':     'formulas/advanced-patterns.md',
-  'formula-bugs':         'formulas/corrections-log.md',
-  'prompt-anatomy':       'prompting/prompt-anatomy.md',
-  'output-contracts':     'prompting/output-contracts.md',
-  'claygent':             'claygent/prompts.md',
-  'pipeline-stages':      'architecture/pipeline-stages.md',
-  'orchestration':        'architecture/orchestration-workarounds.md',
-  'builder-patterns':     'core/builder-patterns.md',
-  'waterfalls':           'enrichment/waterfalls.md',
-  'providers':            'providers/reference.md',
-  'debugging':            'debugging/playbook.md',
-  'data-model':           'core/data-model.md'
-};
-
-const WIKI_BASE = path.join(__dirname, 'kb');
-
-server.tool(
-  'read_kb',
-  `Read a Clay platform reference doc (full markdown). Call alongside data tools whenever the user asks to improve, fix, rewrite, review, audit, debug, design, or optimize Clay content. The schema shows current state; the KB shows what GOOD looks like.
-
-TOPICS:
-  formula-syntax — 8 critical syntax rules, banned JS, working substitutes
-  formula-patterns — Lodash/Moment, scoring, array manipulation
-  formula-bugs — confirmed Clay formula bugs
-  prompt-anatomy — 8-section skeleton for Clay AI prompts
-  output-contracts — JSON schemas, forbidden strings, null policies
-  claygent — Claygent vs Use AI, search strategy, failure modes
-  pipeline-stages — standard pipeline + multi-table patterns
-  orchestration — 15 advanced workarounds
-  builder-patterns — formula vs action columns, cell size, batching
-  waterfalls — waterfall structure, exclusion gates
-  providers — 40+ providers with action keys, credit costs, output paths
-  debugging — diagnostic formulas, yellow triangles, race conditions
-  data-model — column types, 8KB/200KB limits, schema.json
-DON'T USE WHEN: schema alone answers the question (purely descriptive asks).`,
-  {
-    topic: z.string().describe('Topic key from the list above')
-  },
-  async ({ topic }) => {
-    const filePath = KB_TOPICS[topic];
-    if (!filePath) {
-      return { content: [{ type: 'text', text: JSON.stringify({
-        error: `Unknown topic "${topic}"`,
-        availableTopics: Object.keys(KB_TOPICS)
-      }) }] };
-    }
-
-    const fullPath = path.join(WIKI_BASE, filePath);
-    try {
-      const content = fs.readFileSync(fullPath, 'utf-8');
-      return { content: [{ type: 'text', text: content }] };
-    } catch (err) {
-      return { content: [{ type: 'text', text: JSON.stringify({ error: `Error reading ${filePath}: ${err.message}` }) }], isError: true };
-    }
-  }
-);
-
-// ---------------------------------------------------------------------------
-// Knowledge Base resources (also exposed for clients that support resource reads)
-// ---------------------------------------------------------------------------
-
-const KB_RESOURCES = [
-  { path: 'formulas/syntax.md',                       name: 'Formula Syntax Rules',                description: 'Clay formula sandbox: 8 critical syntax rules, banned JS features with working substitutes, run condition patterns' },
-  { path: 'formulas/advanced-patterns.md',            name: 'Advanced Formula Patterns',           description: 'Lodash/Moment.js reference, scoring formulas, type coercion traps, array manipulation, URL parsing' },
-  { path: 'formulas/corrections-log.md',              name: 'Formula Corrections Log',             description: 'Confirmed Clay formula bugs: Object.assign failure, Audiences JSON round-trip, forward-reference cascades' },
-  { path: 'prompting/prompt-anatomy.md',              name: 'Prompt Anatomy (8-Section Structure)', description: 'The 8-section skeleton for all Clay prompts' },
-  { path: 'prompting/output-contracts.md',            name: 'Output Contracts',                    description: 'JSON schema contracts for AI output, mandatory snake_case fields, forbidden strings, null policies' },
-  { path: 'claygent/prompts.md',                      name: 'Claygent & Use AI Prompts',           description: 'Claygent (web research) vs Use AI distinction, mandatory sections, search strategy framework' },
-  { path: 'architecture/pipeline-stages.md',          name: 'Table Architecture & Pipeline Stages', description: 'Standard pipeline stages, signal orchestration, webhook-triggered enrichment, multi-table patterns' },
-  { path: 'architecture/orchestration-workarounds.md', name: 'Orchestration Workarounds',          description: '15 advanced patterns: fan-out, sparse data gates, AI-generated SOQL, screenshot+vision' },
-  { path: 'core/builder-patterns.md',                 name: 'Builder Patterns',                    description: 'Formula vs action columns, cell size expansion, scheduled delays, batch processing, tables as queues' },
-  { path: 'enrichment/waterfalls.md',                 name: 'Waterfall Enrichment Patterns',       description: 'Waterfall structure, cumulative exclusion gates, error-aware gates, dependent waterfall workarounds' },
-  { path: 'providers/reference.md',                   name: 'Enrichment Providers Reference',      description: '40+ providers with action keys, credit costs, output field paths, provider-specific notes' },
-  { path: 'debugging/playbook.md',                    name: 'Debugging Playbook',                  description: 'Step-by-step diagnostics: yellow triangle, action column failures, waterfall stalls, race conditions' },
-  { path: 'core/data-model.md',                       name: 'Clay Data Model',                     description: 'Column types, 8KB vs 200KB limits, schema.json structure, provider output access paths' }
-];
-
-for (const res of KB_RESOURCES) {
-  const uri = `clay-kb://${res.path}`;
-  server.resource(
-    uri,
-    uri,
-    { mimeType: 'text/markdown', description: res.description },
-    async () => {
-      const filePath = path.join(WIKI_BASE, res.path);
-      try {
-        const content = fs.readFileSync(filePath, 'utf-8');
-        return { contents: [{ uri, mimeType: 'text/markdown', text: content }] };
-      } catch (err) {
-        return { contents: [{ uri, mimeType: 'text/plain', text: `Error reading ${res.path}: ${err.message}` }] };
-      }
-    }
-  );
-}
 
 // ---------------------------------------------------------------------------
 // Start
