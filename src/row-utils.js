@@ -1,10 +1,19 @@
 /**
  * Pure data-processing utilities for row data.
  * No API calls — these work on in-memory row arrays.
+ *
+ * Design note: this module only does work the LLM cannot reasonably do
+ * itself within a context budget — counting cell statuses across thousands
+ * of rows, parsing CSV with quoted commas/newlines, projecting cell
+ * payloads to a token-cheap shape. Anything that's pure judgment
+ * (which column is "likely broken", whether a value is an email vs domain,
+ * how to format markdown) lives in prompt context, not here.
  */
 
 /**
- * Status breakdown per column from raw API rows.
+ * Status counts per column from raw API rows.
+ * Returns counts only — no judgment flags. The LLM decides what
+ * "likely broken" or "run-condition gated" means based on context.
  */
 export function analyzeRowStatuses(rows, columnMap) {
   const columns = {};
@@ -14,12 +23,12 @@ export function analyzeRowStatuses(rows, columnMap) {
       if (!columns[fieldId]) {
         columns[fieldId] = {
           fieldId,
-          name:       columnMap[fieldId] || fieldId,
-          success:    0,
-          error:      0,
-          hasNotRun:  0,
-          queued:     0,
-          errors:     {}
+          name:      columnMap[fieldId] || fieldId,
+          success:   0,
+          error:     0,
+          hasNotRun: 0,
+          queued:    0,
+          errors:    {}
         };
       }
 
@@ -38,43 +47,11 @@ export function analyzeRowStatuses(rows, columnMap) {
   }
 
   for (const col of Object.values(columns)) {
-    const total   = col.success + col.error + col.hasNotRun + col.queued;
-    col.total     = total;
-    col.fillPct   = total > 0 ? Math.round((col.success / total) * 100) : 0;
-
-    const errorMsgs = Object.entries(col.errors);
-    col.topError    = errorMsgs.length > 0
-      ? errorMsgs.sort((a, b) => b[1] - a[1])[0][0]
-      : null;
-
-    col.likelyBroken = col.error > 0 && col.success === 0 && col.hasNotRun === 0 && col.queued === 0;
-    col.runConditionGated = col.topError === 'Run condition not met' && col.success === 0;
+    col.total   = col.success + col.error + col.hasNotRun + col.queued;
+    col.fillPct = col.total > 0 ? Math.round((col.success / col.total) * 100) : 0;
   }
 
   return columns;
-}
-
-/**
- * Build a name map from field ID to field name, and format rows for display.
- */
-export function formatRowsForDisplay(rows, schema) {
-  const columnMap = {};
-  for (const f of schema.fields) {
-    columnMap[f.id] = f.name;
-  }
-
-  return rows.map(row => {
-    const formatted = { _rowId: row.id };
-    for (const [fieldId, cell] of Object.entries(row.cells || {})) {
-      if (fieldId === 'f_created_at' || fieldId === 'f_updated_at') continue;
-      const name = columnMap[fieldId] || fieldId;
-      formatted[name] = {
-        value:  cell.value ?? null,
-        status: cell.metadata?.status || null
-      };
-    }
-    return formatted;
-  });
 }
 
 /**
@@ -124,18 +101,26 @@ export function parseCsv(csvText) {
 }
 
 /**
- * Search parsed CSV rows for a text match. Returns matching rows with their line index.
+ * Substring-match parsed CSV rows against a query, returning matches with
+ * their CSV index and the columns whose values matched. The LLM decides
+ * which match is the "right" one — no value-shape classification, no
+ * column prioritization.
  */
 export function searchCsvRows(rows, query, limit) {
-  const searchLower = query.toLowerCase();
+  const needle = String(query).toLowerCase();
+  if (!needle) return [];
+
   const matches = [];
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
-    const match = Object.values(row).some(val =>
-      val != null && String(val).toLowerCase().includes(searchLower)
-    );
-    if (match) {
-      matches.push({ index: i, row });
+    const matchedColumns = [];
+    for (const [col, val] of Object.entries(row)) {
+      if (val != null && String(val).toLowerCase().includes(needle)) {
+        matchedColumns.push(col);
+      }
+    }
+    if (matchedColumns.length > 0) {
+      matches.push({ index: i, row, matchedColumns });
       if (limit && matches.length >= limit) break;
     }
   }
@@ -146,6 +131,10 @@ export function searchCsvRows(rows, query, limit) {
  * Format a full record (from getRecord) with named columns and fullContent.
  * Includes per-cell credit usage from externalContent.upfrontCreditUsage /
  * additionalCreditUsage / hiddenValue.costDetails, and a _credits roll-up.
+ *
+ * This projection drops noise (full action-definition copy, retry history,
+ * UI strings) that would inflate token cost ~10x without adding judgment
+ * value. Kept on the script side because token economics, not prose.
  */
 export function formatRecord(record, schema) {
   const columnMap = {};

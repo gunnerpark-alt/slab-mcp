@@ -52,7 +52,14 @@ const result = await send('tools/call', {
   arguments: { url: URL }
 });
 
-console.log(result.result.content[0].text);
+const json = JSON.parse(result.result.content[0].text);
+console.log(`workbookId: ${json.workbookId}`);
+console.log(`tables: ${json.tables?.length}`);
+console.log(`externalSubroutines: ${json.externalSubroutines?.length}`);
+console.log(`errors: ${json.errors?.length}`);
+for (const t of json.tables || []) {
+  console.log(`  - ${t.tableName} (${t.tableId}) — ${t.fieldCount} fields`);
+}
 
 server.kill();
 process.exit(0);

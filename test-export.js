@@ -51,8 +51,8 @@ console.log('=== sync_table ===');
 const t0 = Date.now();
 const syncResult = await send('tools/call', { name: 'sync_table', arguments: { url: TABLE_URL } });
 console.log(`Done in ${Date.now() - t0}ms`);
-const tableIdMatch = syncResult.result.content[0].text.match(/`(t_[a-zA-Z0-9]+)`/);
-const tableId = tableIdMatch?.[1];
+const syncJson = JSON.parse(syncResult.result.content[0].text);
+const tableId = syncJson.rootSchema?.tableId;
 console.log('tableId:', tableId, '\n');
 
 // 2. get_rows (export path, limit=5)

@@ -76,13 +76,20 @@ const syncText = syncResult.result.content[0].text;
 console.log(syncText.substring(0, 500));
 if (syncText.length > 500) console.log(`\n... (${syncText.length} chars total)\n`);
 
-// Extract tableId from the text
-const tableIdMatch = syncText.match(/Table ID\s*\|\s*`(t_[a-zA-Z0-9]+)`/);
-const tableId = tableIdMatch?.[1];
+// Parse JSON to extract tableId
+let tableId;
+try {
+  const syncJson = JSON.parse(syncText);
+  tableId = syncJson.rootSchema?.tableId;
+} catch (e) {
+  console.error('sync_table did not return JSON:', e.message);
+  server.kill();
+  process.exit(1);
+}
 console.log('Resolved tableId:', tableId);
 
 if (!tableId) {
-  console.error('Could not extract tableId — stopping.');
+  console.error('Could not extract tableId from sync_table response — stopping.');
   server.kill();
   process.exit(1);
 }
@@ -103,15 +110,7 @@ const errorsResult = await send('tools/call', {
 });
 console.log(errorsResult.result.content[0].text.substring(0, 1500));
 
-// 4. analyze_table
-console.log('\n=== analyze_table ===\n');
-const analysisResult = await send('tools/call', {
-  name: 'analyze_table',
-  arguments: { tableId }
-});
-console.log(analysisResult.result.content[0].text.substring(0, 1500));
-
-// 5. get_record (first row from get_rows)
+// 4. get_record (first row from get_rows)
 try {
   const rowsData = JSON.parse(rowsResult.result.content[0].text.replace(/^[^\[]*/, ''));
   const firstRowId = rowsData[0]?._rowId;
