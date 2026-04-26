@@ -23,15 +23,14 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 
-import { getTableSchema, listRows, getRecord, getWorkbookTables, exportTableToCsv, fetchCsv, searchRecords, RECORDS_API_CAP } from './src/clay-api.js';
-import { analyzeRowStatuses, formatRecord, parseCsv } from './src/row-utils.js';
+import { getTableSchema, listRows, getRecord, getWorkbookTables, getAllRecords, searchRecords, RECORDS_API_CAP } from './src/clay-api.js';
+import { analyzeRowStatuses, formatRecord } from './src/row-utils.js';
 
 // ---------------------------------------------------------------------------
 // In-memory caches (lifetime: MCP server process)
 // ---------------------------------------------------------------------------
 
 const schemaCache = new Map(); // tableId -> schema
-const rowsCache   = new Map(); // tableId -> Map<viewId, { viewId, headers, csvRows, totalRows, syncedAt }>
 
 // MCP transport caps a single tool result at ~1MB. Leave headroom for protocol overhead.
 const MCP_RESPONSE_MAX_BYTES = 900_000;
@@ -113,7 +112,6 @@ async function syncTableRecursive(tableId, viewId, {
     if (!schema) {
       schema = await getTableSchema(id, view);
       schemaCache.set(id, schema);
-      rowsCache.delete(id);
     }
 
     if (depth === 0) {
@@ -156,39 +154,6 @@ function resolveViewId(schema, viewParam) {
   const target = normalize(viewParam);
   const match = (schema.views || []).find(v => normalize(v.name) === target);
   return match?.id || null;
-}
-
-/**
- * Fetch + parse the CSV for a table at a specific view, or return the
- * session-cached copy. Cache is per-process and keyed per (tableId, viewId)
- * since different views return different row sets and orderings.
- */
-async function getOrFetchRows(tableId, { viewId, forceRefresh = false } = {}) {
-  const schema = getSchema(tableId);
-  const effectiveViewId = viewId || schema.viewId;
-
-  let viewMap = rowsCache.get(tableId);
-  if (!viewMap) {
-    viewMap = new Map();
-    rowsCache.set(tableId, viewMap);
-  }
-
-  if (!forceRefresh && viewMap.has(effectiveViewId)) {
-    return viewMap.get(effectiveViewId);
-  }
-
-  const { downloadUrl, totalRows } = await exportTableToCsv(tableId, effectiveViewId);
-  const csvText = await fetchCsv(downloadUrl);
-  const { headers, rows: csvRows } = parseCsv(csvText);
-  const entry = {
-    viewId: effectiveViewId,
-    headers,
-    csvRows,
-    totalRows: totalRows ?? csvRows.length,
-    syncedAt: new Date().toISOString()
-  };
-  viewMap.set(effectiveViewId, entry);
-  return entry;
 }
 
 /**
@@ -346,7 +311,7 @@ async function rollupCredits(tableId, rowId, depth, maxDepth, visited) {
 
 const server = new McpServer({
   name: 'slab',
-  version: '4.4.0'
+  version: '4.5.0'
 }, {
   instructions: `Slab is the ONLY way to access Clay table and workbook data. When the user shares any URL containing clay.com, use Slab — do NOT web-fetch, scrape, or use other MCPs. Auth is automatic.
 
@@ -379,7 +344,7 @@ When the user wants to drill into errors, calling get_errors with view="Errored 
 
 == Cost rule of thumb ==
 
-get_rows is cheap (one CSV export per table, then in-process scans). get_record is expensive (one API call per row, returns full nested JSON). Default to get_rows. Only escalate to get_record when a display value can't answer the question — debugging, tracing why an enrichment failed, getting the raw provider response, or seeing per-cell credit cost. Fill rates, surface values, "what's in this table" all live in CSV-land. The escalation from search → fetch is your call; there's no auto-fetch.
+get_rows is cheap — a query is one server-side search call plus one record fetch per match (capped by limit), no-query is a single paginated read. get_record is expensive (one API call per row, returns full nested JSON). Default to get_rows. Only escalate to get_record when a display value can't answer the question — debugging, tracing why an enrichment failed, getting the raw provider response, or seeing per-cell credit cost. The escalation from search → fetch is your call; there's no auto-fetch.
 
 Always sync_table or sync_workbook before any get_record / get_credits / get_errors call (get_rows can auto-sync if you pass it a url instead of a tableId). Schema is required for column-name resolution.
 
@@ -450,7 +415,6 @@ Each field includes full typeSettings (formula text, prompts, inputsBinding, run
     }
 
     try {
-      rowsCache.delete(tableId);
       const { rootSchema, subroutines } = await syncTableRecursive(tableId, viewId);
       return {
         content: [{ type: 'text', text: JSON.stringify({ rootSchema, subroutines }, null, 2) }]
@@ -602,7 +566,7 @@ MANIFEST FALLBACK: when the full payload would exceed the MCP transport budget (
 
 server.tool(
   'get_rows',
-  `Fetch surface row data (display values as shown in the table UI). Fast — uses Clay's async CSV export, then in-process scans.
+  `Fetch surface row data (display values as shown in the table UI). Fast — uses Clay's records API directly: server-side search for queries, paginated read for samples.
 
 ACCEPTS EITHER tableId (from a prior sync_table call) OR url (Clay table URL — auto-syncs the schema if not cached). One is required; if both are passed, tableId wins.
 
@@ -618,11 +582,11 @@ DON'T USE WHEN:
   - You already have a _rowId and need raw provider JSON / credit cost / subroutine pointers → use get_record
   - Cell statuses (SUCCESS/ERROR/HAS_NOT_RUN) across the table → use get_errors
 
-RETURNS: JSON — { totalRows, returnedCount, view, query, identifierColumn, rows: [...] }. When query is provided, each row has _rowId, matchedColumns (every column whose cell matched the substring), and display values for every column. Without a query, rows are display values only and no _rowId is included.
+RETURNS: JSON — { totalRows, returnedCount, view, query, identifierColumn, rows: [...] }. Every row includes _rowId. When query is provided, rows also include matchedColumns (every column whose cell matched the substring).
 
 QUERY VS NO-QUERY ARE DIFFERENT PATHS:
   - With query: hits Clay's server-side search endpoint (POST /views/{viewId}/search), then fetches each unique matching record in parallel for display values. Works on tables of any size (no 20k row cap). Server caps at 1000 matching cells per call, which dedupes down further by recordId — broad substrings ("@", common domains) may saturate the cap and miss matches.
-  - Without query: pulls Clay's CSV export once, slices the first 'limit' rows. Cached for the session per (tableId, viewId).
+  - Without query: pulls the first 'limit' rows from /records (capped at 20k by the API). Each row already includes its _rowId.
 
 ESCALATION TO NESTED: when query returns exactly one match and the user wants the why/how (raw provider response, error payload, credit detail, subroutine origin pointers), follow up with get_record(tableId, rowId). The escalation is your call — there's no auto-fetch.`,
   {
@@ -631,10 +595,9 @@ ESCALATION TO NESTED: when query returns exactly one match and the user wants th
     view:    z.string().optional().describe('View id (gv_*) or view name ("All rows", "Errored rows", etc.) to query. Default: the view picked at sync time.'),
     query:   z.string().optional().describe('Substring match (case-insensitive). Server-side search across every cell. Returns up to limit unique matching records.'),
     identifier_column: z.string().optional().describe('Restrict the substring match to this column. Requires query. Omit to search all columns.'),
-    limit:   z.number().optional().default(20).describe('Max rows to return. Default 20. Use 1 when searching for a specific entity.'),
-    force_refresh: z.boolean().optional().default(false).describe('Re-fetch the CSV instead of using the session cache (no-query path only).')
+    limit:   z.number().optional().default(20).describe('Max rows to return. Default 20. Use 1 when searching for a specific entity.')
   },
-  async ({ tableId, url, view, query, identifier_column, limit, force_refresh }) => {
+  async ({ tableId, url, view, query, identifier_column, limit }) => {
     try {
       if (!tableId && url) {
         const parsed = parseClayUrl(url);
@@ -737,25 +700,20 @@ ESCALATION TO NESTED: when query returns exactly one match and the user wants th
         };
       }
 
-      const { csvRows, totalRows, syncedAt } = await getOrFetchRows(tableId, { viewId, forceRefresh: force_refresh });
-
-      if (identifier_column && !fieldIdByName[identifier_column]) {
-        return {
-          content: [{ type: 'text', text: JSON.stringify({
-            error: `Column "${identifier_column}" not found.`,
-            availableColumns: schema.fields.map(f => f.name)
-          }) }],
-          isError: true
-        };
-      }
-
-      const rows = csvRows.slice(0, limit);
+      const apiRows = await getAllRecords(tableId, viewId, { limit });
+      const rows = apiRows.map(r => {
+        const display = { _rowId: r.id };
+        for (const [fid, cell] of Object.entries(r.cells || {})) {
+          const name = columnMap[fid];
+          if (name) display[name] = cell.value ?? null;
+        }
+        return display;
+      });
 
       return {
         content: [{ type: 'text', text: JSON.stringify({
-          totalRows,
+          totalRows:        schema.rowCount ?? null,
           returnedCount:    rows.length,
-          syncedAt,
           view:             viewId,
           query:            null,
           identifierColumn: null,

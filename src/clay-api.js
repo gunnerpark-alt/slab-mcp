@@ -115,8 +115,7 @@ export async function getDefaultViewId(tableId) {
  * Server-side cap on a single /records fetch. Clay's records endpoint
  * silently ignores every pagination parameter we tried (offset, cursor,
  * after, page, etc.) and returns at most this many rows per call. Tables
- * larger than the cap can only be exhaustively read via the CSV export
- * (exportTableToCsv).
+ * larger than the cap cannot be exhaustively read through this client.
  */
 export const RECORDS_API_CAP = 20000;
 
@@ -183,54 +182,6 @@ export async function searchRecords(tableId, viewId, searchTerm) {
   if (!viewId) throw new Error('No view ID — pass one in the URL or ensure the table has a default view');
   const data = await clayPost(`/tables/${tableId}/views/${viewId}/search`, { searchTerm });
   return data.results || [];
-}
-
-/**
- * Export table to CSV via async job. Returns { downloadUrl, totalRows }.
- * Required for tables larger than RECORDS_API_CAP — the records API doesn't
- * paginate beyond that.
- * CSV contains display values only — no cell statuses or nested JSON.
- */
-export async function exportTableToCsv(tableId, viewId) {
-  if (!viewId) viewId = await getDefaultViewId(tableId);
-  if (!viewId) throw new Error('No view ID — pass one in the URL or ensure the table has a default view');
-
-  const job = await clayPost(`/tables/${tableId}/views/${viewId}/export`);
-  const jobId = job.id;
-  if (!jobId) throw new Error('Export job creation failed — no ID in response');
-
-  const pollIntervalMs = 1200;
-  const maxWaitMs = 5 * 60 * 1000;
-  const startedAt = Date.now();
-
-  while (true) {
-    await new Promise(r => setTimeout(r, pollIntervalMs));
-    const status = await clayRequest(`/exports/${jobId}`);
-
-    if (status.status === 'FINISHED') {
-      return {
-        downloadUrl: status.downloadUrl,
-        totalRows: status.recordsExportedCount ?? null
-      };
-    }
-
-    if (status.status === 'FAILED' || status.status === 'CANCELLED') {
-      throw new Error(`Export job ${jobId} ended with status: ${status.status}`);
-    }
-
-    if (Date.now() - startedAt > maxWaitMs) {
-      throw new Error(`Export job ${jobId} timed out after ${maxWaitMs / 1000}s`);
-    }
-  }
-}
-
-/**
- * Download CSV text from a signed S3 URL.
- */
-export async function fetchCsv(downloadUrl) {
-  const res = await fetch(downloadUrl);
-  if (!res.ok) throw new Error(`Failed to download CSV: ${res.status}`);
-  return res.text();
 }
 
 /**

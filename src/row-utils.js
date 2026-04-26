@@ -4,10 +4,10 @@
  *
  * Design note: this module only does work the LLM cannot reasonably do
  * itself within a context budget — counting cell statuses across thousands
- * of rows, parsing CSV with quoted commas/newlines, projecting cell
- * payloads to a token-cheap shape. Anything that's pure judgment
- * (which column is "likely broken", whether a value is an email vs domain,
- * how to format markdown) lives in prompt context, not here.
+ * of rows, projecting cell payloads to a token-cheap shape. Anything
+ * that's pure judgment (which column is "likely broken", whether a value
+ * is an email vs domain, how to format markdown) lives in prompt context,
+ * not here.
  */
 
 /**
@@ -52,100 +52,6 @@ export function analyzeRowStatuses(rows, columnMap) {
   }
 
   return columns;
-}
-
-/**
- * Parse CSV text into an array of row objects with named keys.
- *
- * Single-pass character scanner that tracks quote state across newlines so
- * multi-line quoted fields (Clay cells routinely contain JSON blobs with
- * literal \n inside) don't fragment into phantom rows. The earlier
- * line-based parser broke row alignment with Clay's records API — every
- * embedded newline shifted the index of every later row.
- */
-export function parseCsv(csvText) {
-  const records = [];
-  let row = [];
-  let cur = '';
-  let inQuotes = false;
-
-  for (let i = 0; i < csvText.length; i++) {
-    const ch = csvText[i];
-    if (inQuotes) {
-      if (ch === '"') {
-        if (csvText[i + 1] === '"') { cur += '"'; i++; }
-        else inQuotes = false;
-      } else {
-        cur += ch;
-      }
-    } else if (ch === '"') {
-      inQuotes = true;
-    } else if (ch === ',') {
-      row.push(cur); cur = '';
-    } else if (ch === '\n') {
-      row.push(cur); cur = '';
-      records.push(row); row = [];
-    } else if (ch !== '\r') {
-      cur += ch;
-    }
-  }
-  if (cur.length > 0 || row.length > 0) {
-    row.push(cur);
-    records.push(row);
-  }
-
-  if (records.length < 2) return { headers: [], rows: [] };
-
-  const headers = records[0];
-  const rows = [];
-  for (let i = 1; i < records.length; i++) {
-    const values = records[i];
-    if (values.length === 1 && values[0] === '') continue;
-    const obj = {};
-    headers.forEach((h, idx) => {
-      obj[h] = values[idx] ?? '';
-    });
-    rows.push(obj);
-  }
-  return { headers, rows };
-}
-
-/**
- * Substring-match parsed CSV rows against a query, returning matches with
- * their CSV index and the columns whose values matched. The LLM decides
- * which match is the "right" one — no value-shape classification, no
- * column prioritization.
- *
- * If identifier_column is provided, only that column is searched; otherwise
- * every column is searched and the matched columns are returned per row so
- * the caller can pick the right hit by column semantics.
- */
-export function searchCsvRows(rows, query, limit, identifier_column = null) {
-  const needle = String(query).toLowerCase();
-  if (!needle) return [];
-
-  const matches = [];
-  for (let i = 0; i < rows.length; i++) {
-    const row = rows[i];
-    const matchedColumns = [];
-    if (identifier_column) {
-      const val = row[identifier_column];
-      if (val != null && String(val).toLowerCase().includes(needle)) {
-        matchedColumns.push(identifier_column);
-      }
-    } else {
-      for (const [col, val] of Object.entries(row)) {
-        if (val != null && String(val).toLowerCase().includes(needle)) {
-          matchedColumns.push(col);
-        }
-      }
-    }
-    if (matchedColumns.length > 0) {
-      matches.push({ index: i, row, matchedColumns });
-      if (limit && matches.length >= limit) break;
-    }
-  }
-  return matches;
 }
 
 /**
