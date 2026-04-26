@@ -54,11 +54,9 @@ slab reads your Clay API key from one of two places, in order:
 
 ### Step 1 — Get your API key
 
-1. Open Clay in a browser and pick the workspace you want slab to read from.
-2. Note the workspace ID — the number in the URL: `app.clay.com/workspaces/<workspace-id>/...`.
-3. Visit `https://app.clay.com/workspaces/<workspace-id>/settings/account` and copy the API key.
+In Clay, go to **Settings → Account → API Key** and copy the key.
 
-The key authenticates against the workspaces it has access to — a workspace-level key reads tables in that workspace and any others your account is a member of, subject to Clay's permissioning. It does **not** grant access to workspaces you aren't already in.
+It's one universal key per Clay account — assuming admin access, it works across every workspace you belong to. You don't need to generate a separate key per workspace.
 
 ### Step 2 — Make the key available to slab
 
@@ -372,7 +370,7 @@ There's no test suite yet. Contributions welcome.
 
 ## Roadmap / known limitations
 
-- **Workspace scope follows the API key.** The key authenticates against the workspaces your Clay account already has access to. To read a different workspace, generate a key in that workspace.
+- **Admin access required.** The API key lives under your Clay account, not a workspace — it works across every workspace you're a member of, but you need admin to retrieve it.
 - **No persistent cache.** Every server restart rehydrates from Clay. For large workbooks this is a few seconds of re-sync.
 - **No test suite.** `test*.js` files are manual probes, not assertions.
 
