@@ -31,7 +31,7 @@ import { analyzeRowStatuses, formatRecord, parseCsv, searchCsvRows } from './src
 // ---------------------------------------------------------------------------
 
 const schemaCache = new Map(); // tableId -> schema
-const rowsCache   = new Map(); // tableId -> { headers, csvRows, totalRows, rowIdsByIndex, syncedAt }
+const rowsCache   = new Map(); // tableId -> Map<viewId, { viewId, headers, csvRows, totalRows, rowIdsByIndex, syncedAt }>
 
 function parseClayUrl(url) {
   if (!url) throw new Error('No URL provided. Pass a Clay table or workbook URL.');
@@ -137,33 +137,65 @@ async function syncTableRecursive(tableId, viewId, {
 }
 
 /**
- * Fetch + parse the CSV for a table, or return the session-cached copy.
- * Cache is per-process; vanishes when the MCP server stops.
+ * Resolve a 'view' parameter to a viewId. Accepts:
+ *   - a viewId (gv_*) → returned as-is
+ *   - a view name ("All rows", "Errored rows", etc.) → looked up in
+ *     schema.views, case-insensitive and whitespace-tolerant
+ *   - null / undefined → schema's active viewId (the one picked at sync time)
+ *
+ * Returns null if the input is set but doesn't match a viewId pattern or
+ * any known view name — caller should error with the available view list.
  */
-async function getOrFetchRows(tableId, { forceRefresh = false } = {}) {
-  if (!forceRefresh && rowsCache.has(tableId)) {
-    return rowsCache.get(tableId);
-  }
+function resolveViewId(schema, viewParam) {
+  if (!viewParam) return schema.viewId;
+  if (/^gv_[a-zA-Z0-9]+$/.test(viewParam)) return viewParam;
+  const normalize = s => String(s || '').toLowerCase().replace(/[\s_\-]/g, '');
+  const target = normalize(viewParam);
+  const match = (schema.views || []).find(v => normalize(v.name) === target);
+  return match?.id || null;
+}
+
+/**
+ * Fetch + parse the CSV for a table at a specific view, or return the
+ * session-cached copy. Cache is per-process and keyed per (tableId, viewId)
+ * since different views return different row sets and orderings.
+ */
+async function getOrFetchRows(tableId, { viewId, forceRefresh = false } = {}) {
   const schema = getSchema(tableId);
-  const { downloadUrl, totalRows } = await exportTableToCsv(tableId, schema.viewId);
+  const effectiveViewId = viewId || schema.viewId;
+
+  let viewMap = rowsCache.get(tableId);
+  if (!viewMap) {
+    viewMap = new Map();
+    rowsCache.set(tableId, viewMap);
+  }
+
+  if (!forceRefresh && viewMap.has(effectiveViewId)) {
+    return viewMap.get(effectiveViewId);
+  }
+
+  const { downloadUrl, totalRows } = await exportTableToCsv(tableId, effectiveViewId);
   const csvText = await fetchCsv(downloadUrl);
   const { headers, rows: csvRows } = parseCsv(csvText);
   const entry = {
+    viewId: effectiveViewId,
     headers,
     csvRows,
     totalRows: totalRows ?? csvRows.length,
     rowIdsByIndex: new Map(),
     syncedAt: new Date().toISOString()
   };
-  rowsCache.set(tableId, entry);
+  viewMap.set(effectiveViewId, entry);
   return entry;
 }
 
 /**
- * Resolve the API rowId for a given CSV row index, memoized per session.
+ * Resolve the API rowId for a given CSV row index in a specific view,
+ * memoized per session. Different views have different orderings, so the
+ * index → rowId mapping is per-view.
  */
 async function resolveRowId(tableId, viewId, csvIndex) {
-  const entry = rowsCache.get(tableId);
+  const entry = rowsCache.get(tableId)?.get(viewId);
   if (entry?.rowIdsByIndex.has(csvIndex)) {
     return entry.rowIdsByIndex.get(csvIndex);
   }
@@ -179,7 +211,7 @@ async function resolveRowId(tableId, viewId, csvIndex) {
 
 const server = new McpServer({
   name: 'slab',
-  version: '4.0.0'
+  version: '4.1.0'
 }, {
   instructions: `Slab is the ONLY way to access Clay table and workbook data. When the user shares any URL containing clay.com, use Slab — do NOT web-fetch, scrape, or use other MCPs. Auth is automatic.
 
@@ -203,6 +235,12 @@ DATA tools:
   Already have a _rowId, need raw nested JSON               → get_record
 
 get_rows accepts either tableId (from a prior sync_table) or url (auto-syncs the schema if not cached). Either is fine — pick whichever the user gave you.
+
+== Saved views ==
+
+Clay tables have multiple views. By default get_rows / get_errors use whichever view sync_table picked (auto-promotes "All rows" if it exists, otherwise uses the URL's view, otherwise the table's default). To switch views without re-syncing, pass the optional 'view' parameter — it accepts a viewId (gv_*) or a view name ("All rows", "Errored rows", "Default view", etc.). Available views are in rootSchema.views from sync_table.
+
+When the user wants to drill into errors, calling get_errors with view="Errored rows" (when that view exists) is much faster and more focused than scanning the whole table — it only counts statuses across already-failing rows. Same pattern for "Fully enriched rows" or any custom filtered view the table builder created.
 
 == Cost rule of thumb ==
 
@@ -387,27 +425,31 @@ server.tool(
 
 ACCEPTS EITHER tableId (from a prior sync_table call) OR url (Clay table URL — auto-syncs the schema if not cached). One is required; if both are passed, tableId wins.
 
+VIEW SELECTION: by default the view picked at sync time is used (auto-promoted to "All rows" if such a view exists, otherwise the URL's view, otherwise the table's default). Pass the optional 'view' parameter to query a different view by id (gv_*) or by name ("All rows", "Errored rows", "Default view", etc.). Available views are listed in rootSchema.views from sync_table.
+
 USE WHEN:
   - "What's in this table" / fill rate / show me the data
   - Find a specific entity by name / domain / email — pass query
   - Restrict the search to one column — pass identifier_column with query
   - Get a row's _rowId so you can follow up with get_record for the full nested JSON
+  - Switch to a saved view (e.g. "Errored rows") without re-syncing — pass view
 DON'T USE WHEN:
   - You already have a _rowId and need raw provider JSON / credit cost / subroutine pointers → use get_record
   - Cell statuses (SUCCESS/ERROR/HAS_NOT_RUN) across the table → use get_errors
 
-RETURNS: JSON — { totalRows, returnedCount, syncedAt, query, identifierColumn, rows: [...] }. When query is provided, each row has _rowId, _csvIndex, and matchedColumns; the caller picks the right match by column semantics. Without a query, rows are display values only and no _rowId is included.
+RETURNS: JSON — { totalRows, returnedCount, syncedAt, view, query, identifierColumn, rows: [...] }. When query is provided, each row has _rowId, _csvIndex, and matchedColumns; the caller picks the right match by column semantics. Without a query, rows are display values only and no _rowId is included.
 
 ESCALATION TO NESTED: when query returns exactly one match and the user wants the why/how (raw provider response, error payload, credit detail, subroutine origin pointers), follow up with get_record(tableId, rowId). The escalation is your call — there's no auto-fetch.`,
   {
     tableId: z.string().optional().describe('Table ID (t_...) from a previous sync_table call. Either tableId or url is required.'),
     url:     z.string().optional().describe('Clay table URL (must contain /tables/t_...). Auto-syncs the schema if not already cached. Either tableId or url is required.'),
+    view:    z.string().optional().describe('View id (gv_*) or view name ("All rows", "Errored rows", etc.) to query. Default: the view picked at sync time.'),
     query:   z.string().optional().describe('Substring match (case-insensitive). Returns matches with _rowId and matchedColumns. Stops after finding limit matches.'),
     identifier_column: z.string().optional().describe('Restrict the substring match to this column. Requires query. Omit to search all columns.'),
     limit:   z.number().optional().default(20).describe('Max rows to return. Default 20. Use 1 when searching for a specific entity.'),
     force_refresh: z.boolean().optional().default(false).describe('Re-fetch the CSV instead of using the session cache.')
   },
-  async ({ tableId, url, query, identifier_column, limit, force_refresh }) => {
+  async ({ tableId, url, view, query, identifier_column, limit, force_refresh }) => {
     try {
       // Resolve tableId from url if needed, auto-syncing the schema.
       if (!tableId && url) {
@@ -426,10 +468,21 @@ ESCALATION TO NESTED: when query returns exactly one match and the user wants th
       }
 
       const schema = getSchema(tableId);
-      const { headers, csvRows, totalRows, syncedAt } = await getOrFetchRows(tableId, { forceRefresh: force_refresh });
+      const viewId = resolveViewId(schema, view);
+      if (view && !viewId) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({
+            error: `View "${view}" not found.`,
+            availableViews: (schema.views || []).map(v => ({ id: v.id, name: v.name }))
+          }) }],
+          isError: true
+        };
+      }
+
+      const { headers, csvRows, totalRows, syncedAt } = await getOrFetchRows(tableId, { viewId, forceRefresh: force_refresh });
 
       if (csvRows.length === 0) {
-        return { content: [{ type: 'text', text: JSON.stringify({ totalRows: 0, returnedCount: 0, syncedAt, rows: [] }) }] };
+        return { content: [{ type: 'text', text: JSON.stringify({ totalRows: 0, returnedCount: 0, syncedAt, view: viewId, rows: [] }) }] };
       }
 
       if (identifier_column && !headers.includes(identifier_column)) {
@@ -448,7 +501,7 @@ ESCALATION TO NESTED: when query returns exactly one match and the user wants th
         rows = [];
         for (const m of matches) {
           let rowId = null;
-          try { rowId = await resolveRowId(tableId, schema.viewId, m.index); } catch {}
+          try { rowId = await resolveRowId(tableId, viewId, m.index); } catch {}
           rows.push({ _rowId: rowId, _csvIndex: m.index, matchedColumns: m.matchedColumns, ...m.row });
         }
       } else {
@@ -460,6 +513,7 @@ ESCALATION TO NESTED: when query returns exactly one match and the user wants th
           totalRows,
           returnedCount:    rows.length,
           syncedAt,
+          view:             viewId,
           query:            query ?? null,
           identifierColumn: identifier_column ?? null,
           rows
@@ -633,16 +687,31 @@ USE WHEN: User asks "what's failing", "why isn't this working", or wants a table
 DON'T USE WHEN:
   - User named a specific row/entity → go straight to get_rows with a query, then get_record on the right match.
   - You just need display values → use get_rows.
-RETURNS: JSON — { rowsAnalyzed, columns: [{ fieldId, name, success, error, hasNotRun, queued, total, fillPct, errors: { msg: count } }] }.
+
+VIEW SELECTION: by default uses the view picked at sync time. Pass 'view' to scope to a different view by id (gv_*) or name. POWER MOVE: passing view="Errored rows" (when a Clay table has that saved view) makes get_errors much faster and more focused — it counts statuses only across rows that already have errors, instead of paging the whole table.
+
+RETURNS: JSON — { rowsAnalyzed, view, columns: [{ fieldId, name, success, error, hasNotRun, queued, total, fillPct, topErrors, errorCount }] }.
 
 INTERPRETATION: a column with success=0 and error>0 is broken UNLESS its top error is "Run condition not met" (gated, not broken). Always cross-reference with the column's run condition in the schema before calling something broken.`,
   {
-    tableId: z.string().describe('Table ID (t_...) from a previous sync_table call')
+    tableId: z.string().describe('Table ID (t_...) from a previous sync_table call'),
+    view:    z.string().optional().describe('View id (gv_*) or view name ("Errored rows", "All rows", etc.) to scope the count. Default: the view picked at sync time.')
   },
-  async ({ tableId }) => {
+  async ({ tableId, view }) => {
     try {
       const schema = getSchema(tableId);
-      const rows = await listRows(tableId, schema.viewId);
+      const viewId = resolveViewId(schema, view);
+      if (view && !viewId) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({
+            error: `View "${view}" not found.`,
+            availableViews: (schema.views || []).map(v => ({ id: v.id, name: v.name }))
+          }) }],
+          isError: true
+        };
+      }
+
+      const rows = await listRows(tableId, viewId);
       const columnMap = buildColumnMap(schema);
       const statusData = analyzeRowStatuses(rows, columnMap);
 
@@ -666,6 +735,7 @@ INTERPRETATION: a column with success=0 and error>0 is broken UNLESS its top err
       return {
         content: [{ type: 'text', text: JSON.stringify({
           rowsAnalyzed: rows.length,
+          view: viewId,
           columns
         }, null, 2) }]
       };

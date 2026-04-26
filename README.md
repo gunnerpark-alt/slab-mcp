@@ -124,10 +124,10 @@ slab exposes six data tools — what a table IS and what's IN it. Builder workfl
 |---|---|---|
 | `sync_table` | URL contains `/tables/` (not `/workbooks/`) | `{ rootSchema, subroutines }`. Schema includes every field's full `typeSettings` (formula text, prompts, run conditions, full inputsBinding) and `pricing` on action fields (basic credits, actionExecution, pre/post-2026 pricing). Recursively syncs invoked functions to depth 3, max 20 tables. |
 | `sync_workbook` | URL contains `/workbooks/` | `{ workbookId, tables, externalSubroutines, errors }`. Every table in the workbook plus any function it calls that lives elsewhere. Cross-table connections are not pre-computed — derive from `typeSettings`. |
-| `get_rows` | Show data, check fill rates, find a row's `_rowId` by query, look up an entity by name / domain / email | `{ totalRows, returnedCount, rows }`. Accepts either `tableId` (from a prior sync_table) or `url` (auto-syncs). With `query`, each row has `_rowId`, `_csvIndex`, and `matchedColumns`; pass `identifier_column` to scope the search to one column. Without a query, rows are display values only and no `_rowId` is included. |
+| `get_rows` | Show data, check fill rates, find a row's `_rowId` by query, look up an entity by name / domain / email, switch to a saved view without re-syncing | `{ totalRows, returnedCount, view, rows }`. Accepts either `tableId` (from a prior sync_table) or `url` (auto-syncs). With `query`, each row has `_rowId`, `_csvIndex`, and `matchedColumns`; pass `identifier_column` to scope the search to one column. Pass `view` (viewId `gv_*` or view name like "All rows" / "Errored rows") to query a different saved view than the one picked at sync time. |
 | `get_record` | You have a `_rowId` and need raw provider JSON, credit cost, or you're following a subroutine `origin` pointer | `{ _rowId, _credits, <columnName>: { value, status, fullContent, credits? } }`. |
 | `get_credits` | "How much did row X cost" / "average credit cost per row" / "which column is most expensive" | One tool, three modes. With `rowId`: that row's per-column breakdown. Without: samples N rows (default 50), aggregates, and extrapolates a total table cost using the schema's row count. Pass `full: true` to scan every row instead of sampling. |
-| `get_errors` | Broad "what's failing" / health check | `{ rowsAnalyzed, columns: [{ success, error, hasNotRun, queued, total, fillPct, topErrors }] }`. Counts only — Claude derives "broken" vs "gated by run condition" from the schema. |
+| `get_errors` | Broad "what's failing" / health check | `{ rowsAnalyzed, view, columns: [{ success, error, hasNotRun, queued, total, fillPct, topErrors }] }`. Counts only — Claude derives "broken" vs "gated by run condition" from the schema. Pass `view="Errored rows"` (or any saved view) to scope the count; on a table with that view, this is much faster than counting across the whole table. |
 
 The MCP server's `instructions` field carries the full decision tree (which tool when, the cost rule of thumb between cheap CSV reads and expensive nested fetches, how to follow subroutine pointers, how to interpret credit fields) — Claude sees it on every conversation that uses any slab tool.
 
@@ -202,12 +202,22 @@ The schema-level pricing (`field.actionDefinition.pricing.credits`) tells you wh
 
 This makes "how much does this row cost" / "what's our average credit spend per row" / "which column is most expensive" / "did this AI call burn $ I didn't expect" answerable without the user opening the Clay UI.
 
+### Saved views
+
+Clay tables expose multiple saved views — typical examples: "Default view," "All rows," "Errored rows," and any custom filtered view the table builder created. Each view returns a different row set (server-side filtered) and potentially a different ordering.
+
+`sync_table` lists every available view in `rootSchema.views: [{ id, name }]` and picks one as the active default. The picker prefers an "All rows" view if it exists, otherwise the URL's view, otherwise the table's first view. That choice is the default for `get_rows` and `get_errors` after sync.
+
+To query a different view without re-syncing, pass the optional `view` parameter to either tool. It accepts a viewId (`gv_*`) or a view name (case- and whitespace-tolerant — `"Errored rows"`, `"errored_rows"`, `"ERRORED ROWS"` all match the same view). The most common power move: `get_errors` with `view="Errored rows"` is much faster and more focused than scanning the whole table — it only counts statuses across already-failing rows. Same pattern works for any custom filter view (`"Fully enriched rows"`, `"Tier 1 accounts only"`, etc.).
+
+The `rowsCache` is keyed per `(tableId, viewId)` because views are different row sets — switching views doesn't re-fetch the original view's data, and switching back later hits the cache.
+
 ### Session caches
 
 Both caches live in-process and vanish when the MCP server restarts. Pass `force_refresh: true` to `get_rows` to discard the rows cache for one tableId; re-syncing a table also invalidates its cached rows.
 
 - `schemaCache`: `tableId → schema`. Populated by `sync_table` / `sync_workbook`, and lazily by `get_rows` when called with a `url` instead of a `tableId`.
-- `rowsCache`: `tableId → { headers, csvRows, totalRows, rowIdsByIndex, syncedAt }`. Populated on first `get_rows` call — see [Row lookup](#2-row-lookup-is-a-csv-bulk-read--lazy-rowid-resolution) above for how the CSV/rowId split works.
+- `rowsCache`: `tableId → Map<viewId, { headers, csvRows, totalRows, rowIdsByIndex, syncedAt }>`. Populated on first `get_rows` call. Keyed per-view because different saved views return different row sets and orderings — the index → rowId mapping has to be per-view too. See [Row lookup](#2-row-lookup-is-a-csv-bulk-read--lazy-rowid-resolution) above for how the CSV/rowId split works.
 
 ---
 
