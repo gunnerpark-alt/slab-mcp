@@ -1,7 +1,7 @@
 {
   "name": "slab-mcp",
-  "version": "1.0.0",
-  "description": "MCP server for analyzing Clay tables — schema, rows, errors, and enrichment debugging",
+  "version": "1.0.0-apikey",
+  "description": "MCP server for analyzing Clay tables — schema, rows, errors, and enrichment debugging (API-key auth)",
   "main": "index.js",
   "type": "module",
   "scripts": {
@@ -13,7 +13,6 @@
     "node": ">=18"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1",
-    "better-sqlite3": "^12.8.0"
+    "@modelcontextprotocol/sdk": "^1.12.1"
   }
 }

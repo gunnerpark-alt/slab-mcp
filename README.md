@@ -1,8 +1,10 @@
-# slab-mcp
+# slab-mcp (API-key edition)
 
-**MCP server for analyzing Clay tables** — schema, rows, errors, credit cost, and enrichment debugging, via the same internal Clay API the frontend uses.
+**MCP server for analyzing Clay tables** — schema, rows, errors, credit cost, and enrichment debugging, via Clay's public v3 API.
 
 Connects Claude (Desktop, Code, or any MCP client) to Clay. Share any `app.clay.com` URL and Claude can read the schema, pull rows, trace enrichment failures end-to-end through Clay Functions (subroutines), and see exactly how many credits each cell consumed. Two installable Claude Code skills (`write-clay-formula`, `write-claygent-prompt`) cover the writing workflows.
+
+> This is the **API-key branch**. It authenticates with a Clay API key instead of a session cookie — cross-platform (macOS / Linux / Windows), no Chrome dependency. The cookie-based version lives on the `main` branch.
 
 ---
 
@@ -18,7 +20,7 @@ Connects Claude (Desktop, Code, or any MCP client) to Clay. Share any `app.clay.
 
 ## Why does this exist?
 
-Clay's public API is minimal. Most of the interesting state — schema, formula text, run conditions, cell statuses, provider responses, **credit cost per cell**, subroutine pointers — only comes back from the internal `/v3/` API the Clay frontend calls. `slab` wraps that API, adds session caches, handles cookie-based auth automatically, and exposes the whole thing as MCP tools.
+Most of the interesting state in a Clay table — schema, formula text, run conditions, cell statuses, provider responses, **credit cost per cell**, subroutine pointers — comes back from the `/v3/` API. `slab` wraps that API, adds session caches, and exposes the whole thing as MCP tools. This branch uses a Clay API key for auth so the server runs anywhere Node runs, with no browser or Keychain dependency.
 
 A core design choice: **slab returns structured JSON, not pre-digested prose**. Earlier versions rendered markdown summaries, classified identifier values by shape, and flagged columns as "likely broken" inside the script. That's all gone. The current shape is: fetch → project to a token-cheap form → return raw JSON. Interpretation, classification, and judgment happen in the LLM. The script's job is fetching, projecting, and caching — not deciding.
 
@@ -26,16 +28,15 @@ A core design choice: **slab returns structured JSON, not pre-digested prose**. 
 
 ## Requirements
 
-- **macOS.** Cookie-reader is Chrome + Keychain specific. Cross-platform auth is on the roadmap.
-- **Node ≥ 18.** Uses native `fetch` + ESM.
-- **Google Chrome**, logged into Clay in any profile. Cookie is read from Chrome's on-disk SQLite DB on every call.
+- **Node ≥ 18.** Uses native `fetch` + ESM. Runs on macOS, Linux, and Windows.
+- **A Clay API key.** Get one from your workspace settings (see [Authentication](#authentication)).
 
 ---
 
 ## Installation
 
 ```bash
-git clone https://github.com/<you>/slab-mcp.git
+git clone -b api-key-auth https://github.com/gunnerpark-alt/slab-mcp.git
 cd slab-mcp
 npm install
 ```
@@ -46,27 +47,40 @@ That's it for the server. Next step is auth + wiring into your MCP client.
 
 ## Authentication
 
-slab reads your Clay session cookie automatically from Chrome. No config needed in the happy path.
+slab reads your Clay API key from one of two places, in order:
 
-### How it works
+1. **`CLAY_API_KEY` environment variable** — recommended for MCP clients (Claude Desktop / Code), set via the server's `env` block (see [Configuration](#configuration)).
+2. **`~/.slab/config.json`** — fallback for users who'd rather not put the key in shell or client config.
 
-1. On every API call, slab opens Chrome's on-disk cookie DB (read-only, copied to a temp file so Chrome keeps its lock).
-2. It fetches the **Chrome Safe Storage** key from the macOS Keychain to decrypt `v10`/`v11` AES-CBC cookie values.
-3. Every `clay.com` / `clay.run` cookie is reassembled and sent as the `Cookie:` header.
+### Step 1 — Get your API key
 
-The first call after install will trigger a macOS keychain prompt (`security` wants to access "Chrome Safe Storage"). Allow it once and you're set.
+1. Open Clay in a browser and pick the workspace you want slab to read from.
+2. Note the workspace ID — the number in the URL: `app.clay.com/workspaces/<workspace-id>/...`.
+3. Visit `https://app.clay.com/workspaces/<workspace-id>/settings/account` and copy the API key.
 
-### Manual fallback
+The key authenticates against the workspaces it has access to — a workspace-level key reads tables in that workspace and any others your account is a member of, subject to Clay's permissioning. It does **not** grant access to workspaces you aren't already in.
 
-If Chrome isn't available or keychain access is denied, create `~/.slab/config.json`:
+### Step 2 — Make the key available to slab
 
-```json
-{ "sessionCookie": "claysession=...; csrf=...; ..." }
+**Option A — via your MCP client config (recommended).** Put the key in the `env` block of the slab server entry (see the [Configuration](#configuration) section below). The key never touches your shell history, the repo, or any file slab creates.
+
+**Option B — `~/.slab/config.json`.** Create the file with mode 600 so only you can read it:
+
+```bash
+mkdir -p ~/.slab
+cat > ~/.slab/config.json <<'EOF'
+{ "apiKey": "<paste-your-key-here>" }
+EOF
+chmod 600 ~/.slab/config.json
 ```
 
-Grab the full cookie header from DevTools → Application → Cookies → `app.clay.com`. You'll need to refresh it whenever Clay rotates the session (typically every few weeks).
+This file is outside the repo and is not checked in. Don't put it inside the slab-mcp checkout.
 
-> **API key auth is on the roadmap** but not yet implemented — the internal `/v3/` API slab uses doesn't accept API keys today.
+### Don't commit your key
+
+- `~/.slab/config.json` is a per-user file outside the repo — safe by location.
+- `.env`, `.env.*`, and `.claude/` are already in `.gitignore` (the second covers Claude Code's local settings, which is where MCP `env` values live).
+- Never paste the key into a file inside this repo, into a commit message, or into the `args` array of an MCP server config (use `env` instead).
 
 ---
 
@@ -74,14 +88,17 @@ Grab the full cookie header from DevTools → Application → Cookies → `app.c
 
 ### Claude Desktop
 
-Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
+Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or the equivalent on your OS:
 
 ```json
 {
   "mcpServers": {
     "slab": {
       "command": "node",
-      "args": ["/absolute/path/to/slab-mcp/index.js"]
+      "args": ["/absolute/path/to/slab-mcp/index.js"],
+      "env": {
+        "CLAY_API_KEY": "<paste-your-key-here>"
+      }
     }
   }
 }
@@ -98,8 +115,21 @@ Add to `~/.claude.json` (user-level) or a project `.mcp.json`:
   "mcpServers": {
     "slab": {
       "command": "node",
-      "args": ["/absolute/path/to/slab-mcp/index.js"]
+      "args": ["/absolute/path/to/slab-mcp/index.js"],
+      "env": {
+        "CLAY_API_KEY": "<paste-your-key-here>"
+      }
     }
+  }
+}
+```
+
+If your project uses `.claude/settings.local.json`, you can put the key there instead — that file is gitignored by Claude Code:
+
+```json
+{
+  "env": {
+    "CLAY_API_KEY": "<paste-your-key-here>"
   }
 }
 ```
@@ -108,10 +138,10 @@ Then in Claude Code run `/mcp` and reconnect `slab`.
 
 ### Any other MCP client
 
-slab is a standard stdio MCP server. Anything that speaks MCP can run it:
+slab is a standard stdio MCP server. Anything that speaks MCP can run it. Make sure `CLAY_API_KEY` is in the environment (or that `~/.slab/config.json` exists):
 
 ```bash
-node /absolute/path/to/slab-mcp/index.js
+CLAY_API_KEY=<your-key> node /absolute/path/to/slab-mcp/index.js
 ```
 
 ---
@@ -147,9 +177,8 @@ Together those two ideas produce slab's shape: **scripts handle what the LLM can
 
 ```
 index.js                 MCP server, tool definitions, decision-tree instructions
-src/clay-api.js          Clay internal API client — endpoint helpers + schema projection
-src/auth.js              Credential resolver (Chrome → ~/.slab/config.json fallback)
-src/cookie-reader.js     Decrypts Chrome's on-disk cookie DB via macOS Keychain
+src/clay-api.js          Clay v3 API client — endpoint helpers + schema projection
+src/auth.js              Credential resolver (CLAY_API_KEY env → ~/.slab/config.json fallback)
 src/row-utils.js         Status counting, record projection (token-cheap shape)
 skills/                  Installable Claude Code skills — write-clay-formula, write-claygent-prompt
 ```
@@ -343,8 +372,7 @@ There's no test suite yet. Contributions welcome.
 
 ## Roadmap / known limitations
 
-- **macOS only.** `cookie-reader.js` uses Chrome's on-disk DB + Keychain. Linux/Windows support would mean a per-browser-per-OS cookie reader per platform.
-- **Cookie auth only.** API key support is desired but the internal `/v3/` API slab uses doesn't accept keys today.
+- **Workspace scope follows the API key.** The key authenticates against the workspaces your Clay account already has access to. To read a different workspace, generate a key in that workspace.
 - **No persistent cache.** Every server restart rehydrates from Clay. For large workbooks this is a few seconds of re-sync.
 - **No test suite.** `test*.js` files are manual probes, not assertions.
 

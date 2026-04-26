@@ -1,13 +1,15 @@
 /**
- * Credential manager for slab-mcp.
- * Session cookie: auto-read from Chrome's on-disk DB every call (always fresh).
- * Fallback: manually stored in ~/.slab/config.json.
+ * Credential manager for slab-mcp (API-key edition).
+ * Source order: CLAY_API_KEY env var → ~/.slab/config.json ({ "apiKey": "..." }) → throw.
+ *
+ * The key is sent as `Authorization: <raw-key>` (no `Bearer` prefix) — that's the
+ * shape Clay's public v3 API expects. Get a key from
+ * https://app.clay.com/workspaces/<your-workspace>/settings/account.
  */
 
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { readClaySessionCookie } from './cookie-reader.js';
 
 const CONFIG_PATH = path.join(os.homedir(), '.slab', 'config.json');
 
@@ -20,32 +22,25 @@ function loadConfig() {
   return {};
 }
 
-export function getSessionCookie() {
-  // 1. Try Chrome's on-disk cookie DB (always freshest)
-  try {
-    const cookie = readClaySessionCookie();
-    if (cookie) return cookie;
-  } catch {}
+export function getApiKey() {
+  const fromEnv = process.env.CLAY_API_KEY;
+  if (fromEnv && fromEnv.trim()) return fromEnv.trim();
 
-  // 2. Fall back to manually stored cookie
   const config = loadConfig();
-  if (config.sessionCookie) return config.sessionCookie;
+  if (config.apiKey && String(config.apiKey).trim()) return String(config.apiKey).trim();
 
   throw new Error(
-    'No Clay session cookie found.\n' +
-    '  Option 1: Make sure Chrome is open and you are logged into Clay.\n' +
-    '  Option 2: Create ~/.slab/config.json with { "sessionCookie": "claysession=..." }'
+    'No Clay API key found.\n' +
+    '  Option 1 (recommended): set CLAY_API_KEY in your MCP server config\'s env block.\n' +
+    '  Option 2: create ~/.slab/config.json with { "apiKey": "<your-key>" }\n' +
+    '  Get your key at https://app.clay.com/workspaces/<workspace-id>/settings/account'
   );
 }
 
 export function getInternalApiHeaders() {
-  const cookie = getSessionCookie();
   return {
-    'Cookie': cookie,
-    'X-Clay-Frontend-Version': 'unknown',
+    'Authorization': getApiKey(),
     'Accept': 'application/json',
-    'Content-Type': 'application/json',
-    'Origin': 'https://app.clay.com',
-    'Referer': 'https://app.clay.com/'
+    'Content-Type': 'application/json'
   };
 }
