@@ -198,12 +198,17 @@ DATA tools:
   Specific named entity, surface display value is enough    → get_rows with query
   "What's in the table" / fill rate                         → get_rows
   "What's broken" / "why are errors"                        → get_errors
+  "Debug" / "investigate" a specific row or failing column  → get_errors to find a failing _rowId, then find_record / get_record on it, then follow every subroutine origin pointer (debugging without nested JSON is guessing)
   "How much does this table cost" / "avg credits per row"   → get_credits (no rowId, samples)
   "How much did row X cost" / "which column is expensive"   → get_credits with rowId
   Already have a _rowId, need raw nested JSON               → get_record
 
 KNOWLEDGE tool:
   Improve / fix / rewrite / review / debug / design / audit → read_kb (alongside data tools, not instead of them)
+
+== Cost rule of thumb ==
+
+get_rows is cheap (one CSV export per table, then in-process scans). get_record is expensive (one API call per row, returns full nested JSON). find_record uses get_rows under the hood and only escalates to get_record on a unique hit. Default to get_rows. Only reach for nested JSON when a display value can't answer the question — debugging, tracing why an enrichment failed, getting the raw provider response, or seeing per-cell credit cost. Fill rates, surface values, "what's in this table" all live in CSV-land.
 
 Always sync_table or sync_workbook before any get_* / find_record call. Schema is required for column-name resolution.
 
