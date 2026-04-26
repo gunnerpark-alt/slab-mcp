@@ -40,6 +40,29 @@ If you're not sure which mode the task wants:
 
 This applies to both modes.
 
+### Step 0: Diagnose the Current Prompt (mandatory when rewriting, skip when creating)
+
+**If the user is asking you to rewrite, fix, improve, or review an EXISTING prompt in a Clay column, you MUST first fetch a sample of what that prompt actually returns at runtime. The prompt template tells you what was asked; the runtime output tells you what's actually happening — those are often different things.**
+
+Skip this step ONLY when creating a brand-new prompt with no prior runs.
+
+Procedure:
+
+1. **Identify the column.** From the synced schema, locate the action column with `actionKey: "use-ai"` whose prompt the user wants to rewrite. Note its `fieldId`.
+2. **Pick 2–3 representative rows.** Use `get_rows` (with the table's URL or tableId) and a query that pulls a mix — at least one obvious-success row, at least one row that looks like an edge case from its surface display. Capture the `_rowId` for each.
+3. **Fetch the nested output for each row.** For every captured `_rowId`: call `get_record(tableId, rowId)` and read the cell's `externalContent.fullValue` for the column you're diagnosing.
+4. **Read what's actually there.** For each fetched row, examine:
+   - `stepsTaken` — the agent's research trail. Did it actually do what the prompt asked? Did it visit the prioritized sources or just defaults? Did it pivot laterally to find the answer somewhere unexpected?
+   - `reasoning` / `fitReasoning` / equivalent — the model's own explanation of its answer. Is it consistent with the prompt's classification logic, or has it drifted?
+   - `sources` — which sites did it actually cite? Were they the authoritative ones the prompt prioritized, or fallbacks?
+   - `confidence` — is it consistent across rows or wildly variable?
+   - The output JSON shape — does every row match the prompt's stated schema, or has the shape drifted between rows?
+5. **Cross-check upstream.** Look at the cells fed into this prompt's `inputsBinding`. Is the prompt asking the model to determine something an upstream cheaper column already knows? (Common waste pattern: a downstream gpt-5 Claygent computing a fact that a 1-credit geocode upstream already returned.)
+
+This diagnostic almost always changes what you'd rewrite. Without it, you're rewriting a prompt template based on what it *claims* to do — not what it actually does.
+
+Once Step 0 is done (or skipped because you're creating a new prompt), proceed to Step 1.
+
 ### Step 1: Gather Requirements
 
 Before writing any prompt, collect from the user. **Ask if any are missing — don't assume.**
@@ -583,6 +606,7 @@ Before outputting, verify:
 
 ### Web Research Mode
 
+- [ ] (Rewriting only) Step 0 diagnostic ran: fetched get_record on 2-3 representative rows, read stepsTaken / reasoning / sources / output shape from runtime nested JSON
 - [ ] OBJECTIVE uses imperative voice and starts with *"You are an expert..."*
 - [ ] All 12 mandatory sections present and in order
 - [ ] All major sections use `==================` block delimiters
@@ -602,6 +626,7 @@ Before outputting, verify:
 
 ### Content Manipulation Mode
 
+- [ ] (Rewriting only) Step 0 diagnostic ran: fetched get_record on 2-3 representative rows, read reasoning / output shape / confidence consistency from runtime nested JSON
 - [ ] OBJECTIVE explicitly states *"no internet access"* / *"content manipulation and reasoning task"*
 - [ ] All 10 mandatory sections present and in order
 - [ ] All major sections use `==================` block delimiters

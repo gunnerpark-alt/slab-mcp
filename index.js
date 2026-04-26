@@ -210,6 +210,22 @@ get_rows is cheap (one CSV export per table, then in-process scans). get_record 
 
 Always sync_table or sync_workbook before any get_record / get_credits / get_errors call (get_rows can auto-sync if you pass it a url instead of a tableId). Schema is required for column-name resolution.
 
+== Cases where nested JSON is mandatory (no shortcut) ==
+
+These tasks REQUIRE get_record on a real populated row. Don't try to answer them from schema + surface values alone — surface views show "Response" or truncated strings for action columns, and you'll be confidently wrong about what's actually happening.
+
+  Optimizing / rewriting / reviewing a Claygent or Use AI prompt
+  ──────────────────────────────────────────────────────────────
+  The prompt template tells you what was asked. The nested output tells you what the model actually returned: stepsTaken (research trail — every site visited, every query tried), reasoning, sources cited, confidence, where the answer actually came from. Common findings only visible in nested output: prompts asking for data that's already available upstream from a cheaper column (waste — e.g. a Mapbox geocode already returns "neighborhood: Upper West Side" but a downstream gpt-5 Claygent is paying 3.9 credits to determine the same thing); prompts the model partially ignores (drift between template and behavior); prompts producing different output shapes across rows (contract drift). Fetch get_record on 1-3 representative rows BEFORE proposing any prompt changes. The write-claygent-prompt skill enforces this as a Step 0 gate.
+
+  Tracing data flow across one or more tables
+  ────────────────────────────────────────────
+  Surface display values for action columns are placeholders ("Response", truncated strings, summary text). They hide the actual JSON that was passed downstream to the next stage. To trace what flows from column A to column B you need fullContent on a real row. Same for cross-table tracing — every fullContent.origin pointer needs get_record(origin.tableId, origin.recordId) to see what the subroutine actually returned to the parent.
+
+  Auditing why a column behaves a certain way
+  ────────────────────────────────────────────
+  The stepsTaken array on Claygent outputs is the research audit trail (which sites visited, which queries tried, what evidence was rejected, what lateral pivots the agent made). It's not in surface views, not in the schema, only in externalContent. If the user asks "why did this row get classified this way," that array IS the answer.
+
 == Interpretation rules ==
 
 Identifier matching (get_rows with query):
