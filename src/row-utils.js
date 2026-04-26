@@ -56,46 +56,56 @@ export function analyzeRowStatuses(rows, columnMap) {
 
 /**
  * Parse CSV text into an array of row objects with named keys.
- * Handles quoted fields with commas and newlines.
+ *
+ * Single-pass character scanner that tracks quote state across newlines so
+ * multi-line quoted fields (Clay cells routinely contain JSON blobs with
+ * literal \n inside) don't fragment into phantom rows. The earlier
+ * line-based parser broke row alignment with Clay's records API — every
+ * embedded newline shifted the index of every later row.
  */
 export function parseCsv(csvText) {
-  const lines = csvText.split('\n');
-  if (lines.length < 2) return { headers: [], rows: [] };
+  const records = [];
+  let row = [];
+  let cur = '';
+  let inQuotes = false;
 
-  function parseLine(line) {
-    const values = [];
-    let current = '';
-    let inQuotes = false;
-    for (let i = 0; i < line.length; i++) {
-      const ch = line[i];
+  for (let i = 0; i < csvText.length; i++) {
+    const ch = csvText[i];
+    if (inQuotes) {
       if (ch === '"') {
-        if (inQuotes && line[i + 1] === '"') {
-          current += '"';
-          i++;
-        } else {
-          inQuotes = !inQuotes;
-        }
-      } else if (ch === ',' && !inQuotes) {
-        values.push(current);
-        current = '';
+        if (csvText[i + 1] === '"') { cur += '"'; i++; }
+        else inQuotes = false;
       } else {
-        current += ch;
+        cur += ch;
       }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ',') {
+      row.push(cur); cur = '';
+    } else if (ch === '\n') {
+      row.push(cur); cur = '';
+      records.push(row); row = [];
+    } else if (ch !== '\r') {
+      cur += ch;
     }
-    values.push(current);
-    return values;
+  }
+  if (cur.length > 0 || row.length > 0) {
+    row.push(cur);
+    records.push(row);
   }
 
-  const headers = parseLine(lines[0]);
+  if (records.length < 2) return { headers: [], rows: [] };
+
+  const headers = records[0];
   const rows = [];
-  for (let i = 1; i < lines.length; i++) {
-    if (!lines[i].trim()) continue;
-    const values = parseLine(lines[i]);
-    const row = {};
+  for (let i = 1; i < records.length; i++) {
+    const values = records[i];
+    if (values.length === 1 && values[0] === '') continue;
+    const obj = {};
     headers.forEach((h, idx) => {
-      row[h] = values[idx] ?? '';
+      obj[h] = values[idx] ?? '';
     });
-    rows.push(row);
+    rows.push(obj);
   }
   return { headers, rows };
 }

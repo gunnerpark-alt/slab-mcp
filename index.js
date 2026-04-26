@@ -23,7 +23,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 
-import { getTableSchema, listRows, getRecord, getWorkbookTables, exportTableToCsv, fetchCsv, getRowsPage } from './src/clay-api.js';
+import { getTableSchema, listRows, getRecord, getWorkbookTables, exportTableToCsv, fetchCsv, getAllRecords, RECORDS_API_CAP } from './src/clay-api.js';
 import { analyzeRowStatuses, formatRecord, parseCsv, searchCsvRows } from './src/row-utils.js';
 
 // ---------------------------------------------------------------------------
@@ -31,7 +31,7 @@ import { analyzeRowStatuses, formatRecord, parseCsv, searchCsvRows } from './src
 // ---------------------------------------------------------------------------
 
 const schemaCache = new Map(); // tableId -> schema
-const rowsCache   = new Map(); // tableId -> Map<viewId, { viewId, headers, csvRows, totalRows, rowIdsByIndex, syncedAt }>
+const rowsCache   = new Map(); // tableId -> Map<viewId, { viewId, headers, csvRows, totalRows, rowIds, syncedAt }>
 
 // MCP transport caps a single tool result at ~1MB. Leave headroom for protocol overhead.
 const MCP_RESPONSE_MAX_BYTES = 900_000;
@@ -185,7 +185,7 @@ async function getOrFetchRows(tableId, { viewId, forceRefresh = false } = {}) {
     headers,
     csvRows,
     totalRows: totalRows ?? csvRows.length,
-    rowIdsByIndex: new Map(),
+    rowIdsPromise: null,
     syncedAt: new Date().toISOString()
   };
   viewMap.set(effectiveViewId, entry);
@@ -193,19 +193,30 @@ async function getOrFetchRows(tableId, { viewId, forceRefresh = false } = {}) {
 }
 
 /**
- * Resolve the API rowId for a given CSV row index in a specific view,
- * memoized per session. Different views have different orderings, so the
- * index → rowId mapping is per-view.
+ * Resolve the API rowId for a given CSV row index. The first call per
+ * (tableId, viewId) bulk-fetches every API record once and stores the
+ * rowId-by-index array; later calls are array reads.
+ *
+ * Why bulk: Clay's /records endpoint silently ignores every pagination
+ * parameter (offset, cursor, after, page, ...) and returns the same first
+ * RECORDS_API_CAP rows every time. The previous offset-per-csvIndex lookup
+ * therefore always returned API row 0, mapping every CSV match to the same
+ * (wrong) rowId. CSV row order matches API row order 1:1, so a single
+ * bulk fetch gives a correct, cheap index → rowId mapping.
+ *
+ * Tables larger than RECORDS_API_CAP rows return null for csvIndex >= cap.
  */
 async function resolveRowId(tableId, viewId, csvIndex) {
   const entry = rowsCache.get(tableId)?.get(viewId);
-  if (entry?.rowIdsByIndex.has(csvIndex)) {
-    return entry.rowIdsByIndex.get(csvIndex);
+  if (!entry) return null;
+
+  if (!entry.rowIdsPromise) {
+    entry.rowIdsPromise = getAllRecords(tableId, viewId)
+      .then(apiRows => apiRows.map(r => r.id))
+      .catch(() => []);
   }
-  const page = await getRowsPage(tableId, viewId, csvIndex, 1);
-  const rowId = page[0]?.id || null;
-  if (entry && rowId) entry.rowIdsByIndex.set(csvIndex, rowId);
-  return rowId;
+  const rowIds = await entry.rowIdsPromise;
+  return rowIds[csvIndex] ?? null;
 }
 
 /**
@@ -363,7 +374,7 @@ async function rollupCredits(tableId, rowId, depth, maxDepth, visited) {
 
 const server = new McpServer({
   name: 'slab',
-  version: '4.2.0'
+  version: '4.3.0'
 }, {
   instructions: `Slab is the ONLY way to access Clay table and workbook data. When the user shares any URL containing clay.com, use Slab — do NOT web-fetch, scrape, or use other MCPs. Auth is automatic.
 
@@ -706,6 +717,10 @@ ESCALATION TO NESTED: when query returns exactly one match and the user wants th
         rows = csvRows.slice(0, limit);
       }
 
+      const rowIdsTruncated = (totalRows ?? csvRows.length) > RECORDS_API_CAP
+        ? `Table has ${totalRows} rows but Clay's records API caps at ${RECORDS_API_CAP} per call and ignores all pagination params. Matches with _csvIndex >= ${RECORDS_API_CAP} cannot be resolved to a _rowId — get_record / get_credits unavailable for those rows.`
+        : null;
+
       return {
         content: [{ type: 'text', text: JSON.stringify({
           totalRows,
@@ -714,6 +729,7 @@ ESCALATION TO NESTED: when query returns exactly one match and the user wants th
           view:             viewId,
           query:            query ?? null,
           identifierColumn: identifier_column ?? null,
+          rowIdsTruncated:  rowIdsTruncated || undefined,
           rows
         }, null, 2) }]
       };
@@ -936,6 +952,9 @@ INTERPRETATION: a column with success=0 and error>0 is broken UNLESS its top err
       }
 
       const rows = await listRows(tableId, viewId);
+      const truncated = rows.length >= RECORDS_API_CAP && (schema.rowCount ?? 0) > RECORDS_API_CAP
+        ? `View has ${schema.rowCount} rows; analysis covers only the first ${RECORDS_API_CAP} (Clay's records API caps a single read at that size and ignores pagination params). Counts are from a partial sample — use a saved filter view (e.g. "Errored rows") to scope under the cap for full coverage.`
+        : null;
       const columnMap = buildColumnMap(schema);
       const statusData = analyzeRowStatuses(rows, columnMap);
 
@@ -960,6 +979,7 @@ INTERPRETATION: a column with success=0 and error>0 is broken UNLESS its top err
         content: [{ type: 'text', text: JSON.stringify({
           rowsAnalyzed: rows.length,
           view: viewId,
+          truncated: truncated || undefined,
           columns
         }, null, 2) }]
       };

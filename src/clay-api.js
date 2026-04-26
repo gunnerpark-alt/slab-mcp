@@ -112,50 +112,55 @@ export async function getDefaultViewId(tableId) {
 }
 
 /**
- * List rows with display values + statuses (paginated).
+ * Server-side cap on a single /records fetch. Clay's records endpoint
+ * silently ignores every pagination parameter we tried (offset, cursor,
+ * after, page, etc.) and returns at most this many rows per call. Tables
+ * larger than the cap can only be exhaustively read via the CSV export
+ * (exportTableToCsv).
+ */
+export const RECORDS_API_CAP = 20000;
+
+/**
+ * Fetch rows for a view in one shot — display values, statuses, rowIds.
+ * Caps at RECORDS_API_CAP because no pagination scheme works on this
+ * endpoint. Caller is responsible for knowing whether the table fits.
+ */
+export async function getAllRecords(tableId, viewId, { limit = RECORDS_API_CAP } = {}) {
+  if (!viewId) viewId = await getDefaultViewId(tableId);
+  if (!viewId) throw new Error('No view ID — pass one in the URL or ensure the table has a default view');
+  const cap = Math.min(limit, RECORDS_API_CAP);
+  const data = await clayRequest(`/tables/${tableId}/views/${viewId}/records?limit=${cap}`);
+  return data.results || [];
+}
+
+/**
+ * List rows with display values + statuses.
  * No fullContent — use getRecord() for that.
  *
  * Options:
- *   limit     — max rows to return (default: all)
+ *   limit     — max rows to return (default: RECORDS_API_CAP)
  *   query     — text filter (case-insensitive match on display values)
- *   pageSize  — rows per API page (default: 100)
  */
-export async function listRows(tableId, viewId, { limit, query, pageSize = 100 } = {}) {
-  if (!viewId) viewId = await getDefaultViewId(tableId);
-  if (!viewId) throw new Error('No view ID — pass one in the URL or ensure the table has a default view');
+export async function listRows(tableId, viewId, { limit, query } = {}) {
+  const fetchLimit = limit ? Math.min(limit, RECORDS_API_CAP) : RECORDS_API_CAP;
+  const rows = await getAllRecords(tableId, viewId, { limit: fetchLimit });
 
-  const rows = [];
-  let offset = 0;
-  const searchLower = query ? query.toLowerCase() : null;
+  if (!query) return rows;
 
-  while (true) {
-    const data = await clayRequest(`/tables/${tableId}/views/${viewId}/records?limit=${pageSize}&offset=${offset}`);
-    const page = data.results || [];
-    if (page.length === 0) break;
-
-    if (searchLower) {
-      for (const row of page) {
-        const cells = row.cells || {};
-        const match = Object.values(cells).some(cell => {
-          const val = cell.value;
-          return val != null && String(val).toLowerCase().includes(searchLower);
-        });
-        if (match) {
-          rows.push(row);
-          if (limit && rows.length >= limit) return rows;
-        }
-      }
-    } else {
-      rows.push(...page);
-      if (limit && rows.length >= limit) return rows.slice(0, limit);
+  const needle = query.toLowerCase();
+  const filtered = [];
+  for (const row of rows) {
+    const cells = row.cells || {};
+    const match = Object.values(cells).some(cell => {
+      const val = cell.value;
+      return val != null && String(val).toLowerCase().includes(needle);
+    });
+    if (match) {
+      filtered.push(row);
+      if (limit && filtered.length >= limit) break;
     }
-
-    if (page.length < pageSize) break;
-    offset += page.length;
-    await new Promise(r => setTimeout(r, 350));
   }
-
-  return rows;
+  return filtered;
 }
 
 /**
@@ -167,7 +172,8 @@ export async function getRecord(tableId, recordId) {
 
 /**
  * Export table to CSV via async job. Returns { downloadUrl, totalRows }.
- * Faster than paginated listRows for full table fetches.
+ * Required for tables larger than RECORDS_API_CAP — the records API doesn't
+ * paginate beyond that.
  * CSV contains display values only — no cell statuses or nested JSON.
  */
 export async function exportTableToCsv(tableId, viewId) {
@@ -201,16 +207,6 @@ export async function exportTableToCsv(tableId, viewId) {
       throw new Error(`Export job ${jobId} timed out after ${maxWaitMs / 1000}s`);
     }
   }
-}
-
-/**
- * Fetch a single page of rows at a specific offset.
- * Used to resolve row IDs by CSV position.
- */
-export async function getRowsPage(tableId, viewId, offset, limit = 1) {
-  if (!viewId) viewId = await getDefaultViewId(tableId);
-  const data = await clayRequest(`/tables/${tableId}/views/${viewId}/records?limit=${limit}&offset=${offset}`);
-  return data.results || [];
 }
 
 /**
