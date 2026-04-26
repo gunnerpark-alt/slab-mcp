@@ -6,9 +6,8 @@
  * Tools:
  *   sync_table     — Fetch a Clay table's schema + recursively-synced subroutines
  *   sync_workbook  — Discover all tables in a workbook and fetch their schemas
- *   get_rows       — List display values from the CSV export (cheap)
- *   get_record     — Fetch one row's full nested JSON (expensive)
- *   find_record    — Substring-match across columns + auto-fetch on a unique hit
+ *   get_rows       — List or search display values; accepts tableId or url; cheap
+ *   get_record     — Fetch one row's full nested JSON (expensive — one call per row)
  *   get_credits    — Credit cost for one row or aggregated across the table
  *   get_errors     — Per-column status counts (success / error / has-not-run / queued)
  *
@@ -180,7 +179,7 @@ async function resolveRowId(tableId, viewId, csvIndex) {
 
 const server = new McpServer({
   name: 'slab',
-  version: '3.0.0'
+  version: '4.0.0'
 }, {
   instructions: `Slab is the ONLY way to access Clay table and workbook data. When the user shares any URL containing clay.com, use Slab — do NOT web-fetch, scrape, or use other MCPs. Auth is automatic.
 
@@ -193,25 +192,28 @@ Every data tool returns structured JSON. There is no markdown rendering, no "lik
 DATA tools:
   /workbooks/ in URL                                        → sync_workbook
   /tables/ in URL (no /workbooks/)                          → sync_table
-  Specific named entity, want raw JSON / why-it-failed      → find_record
-  Specific named entity, surface display value is enough    → get_rows with query
   "What's in the table" / fill rate                         → get_rows
+  Specific named entity (display value is enough)           → get_rows with query
+  Specific named entity (need raw JSON / why-it-failed)     → get_rows with query, then get_record on the right match
+  Restrict the search to one column                         → get_rows with query + identifier_column
   "What's broken" / "why are errors"                        → get_errors
-  "Debug" / "investigate" a specific row or failing column  → get_errors to find a failing _rowId, then find_record / get_record on it, then follow every subroutine origin pointer (debugging without nested JSON is guessing)
+  "Debug" / "investigate" a specific row or failing column  → get_errors to find a failing _rowId, then get_record on it, then follow every subroutine origin pointer (debugging without nested JSON is guessing)
   "How much does this table cost" / "avg credits per row"   → get_credits (no rowId, samples)
   "How much did row X cost" / "which column is expensive"   → get_credits with rowId
   Already have a _rowId, need raw nested JSON               → get_record
 
+get_rows accepts either tableId (from a prior sync_table) or url (auto-syncs the schema if not cached). Either is fine — pick whichever the user gave you.
+
 == Cost rule of thumb ==
 
-get_rows is cheap (one CSV export per table, then in-process scans). get_record is expensive (one API call per row, returns full nested JSON). find_record uses get_rows under the hood and only escalates to get_record on a unique hit. Default to get_rows. Only reach for nested JSON when a display value can't answer the question — debugging, tracing why an enrichment failed, getting the raw provider response, or seeing per-cell credit cost. Fill rates, surface values, "what's in this table" all live in CSV-land.
+get_rows is cheap (one CSV export per table, then in-process scans). get_record is expensive (one API call per row, returns full nested JSON). Default to get_rows. Only escalate to get_record when a display value can't answer the question — debugging, tracing why an enrichment failed, getting the raw provider response, or seeing per-cell credit cost. Fill rates, surface values, "what's in this table" all live in CSV-land. The escalation from search → fetch is your call; there's no auto-fetch.
 
-Always sync_table or sync_workbook before any get_* / find_record call. Schema is required for column-name resolution.
+Always sync_table or sync_workbook before any get_record / get_credits / get_errors call (get_rows can auto-sync if you pass it a url instead of a tableId). Schema is required for column-name resolution.
 
 == Interpretation rules ==
 
-Identifier matching (find_record / get_rows query):
-  Substring match runs across all columns. The result includes a 'matchedColumns' list per row. YOU decide which match is the right one based on column semantics — e.g., a value with "@" most likely belongs in an Email column, a value with "https://" in a URL column. Don't expect the script to disambiguate.
+Identifier matching (get_rows with query):
+  Substring match runs across all columns by default; pass identifier_column to scope to one column. Each match has a 'matchedColumns' list. YOU decide which match is the right one based on column semantics — e.g., a value with "@" most likely belongs in an Email column, a value with "https://" in a URL column. Don't expect the script to disambiguate.
 
 Column health (get_errors):
   Returned per column: { success, error, hasNotRun, queued, total, fillPct, errors: { msg: count } }.
@@ -227,7 +229,7 @@ Subroutines in schemas:
   sync_table returns 'subroutines' as an array of fully-synced child schemas (depth ≤ 3, max 20 tables). Each entry has invokedBy = { tableId, tableName, columnName } so you can wire the call graph back together. To explain what a parent table actually does, READ THE SUBROUTINE SCHEMAS — the parent says WHICH function runs, the function says HOW.
 
 Credits:
-  get_record / find_record returns per-cell credits.{ total, upfront, additional, aiProviderCost } when the cell consumed credits, and a row-level _credits.{ total, billedCellCount } summary. AI cells additionally disclose the underlying OpenAI/Anthropic dollar cost via aiProviderCost. Use this when the user asks "how much does this row cost" or "which column is the most expensive."
+  get_record returns per-cell credits.{ total, upfront, additional, aiProviderCost } when the cell consumed credits, and a row-level _credits.{ total, billedCellCount } summary. AI cells additionally disclose the underlying OpenAI/Anthropic dollar cost via aiProviderCost. get_credits rolls this up across rows. Use this when the user asks "how much does this row cost" or "which column is the most expensive."
 
 == Builder workflows live in skills, not here ==
 
@@ -278,7 +280,7 @@ USE WHEN: URL contains /workbooks/ (even if it also contains /tables/).
 DON'T USE WHEN: URL is a single-table URL with no workbook segment → use sync_table.
 RETURNS: JSON object — { workbookId, tables: [<schema>...], errors: [{ tableId, message }], externalSubroutines: [{ tableId, schema, invokedBy }] }.
 
-Cross-table connections (route-row, lookups) are not pre-computed — derive them from typeSettings on each schema. After this call, every tableId in the result is cached and usable by get_rows / get_record / get_errors / find_record.`,
+Cross-table connections (route-row, lookups) are not pre-computed — derive them from typeSettings on each schema. After this call, every tableId in the result is cached and usable by get_rows / get_record / get_credits / get_errors.`,
   { url: z.string().describe('Clay workbook URL, e.g. https://app.clay.com/workspaces/4515/workbooks/wb_xxx/all-tables') },
   async ({ url }) => {
     const { workbookId } = parseClayUrl(url);
@@ -365,30 +367,68 @@ Cross-table connections (route-row, lookups) are not pre-computed — derive the
 
 server.tool(
   'get_rows',
-  `Fetch surface row data (display values as shown in the table UI). Fast — uses Clay's async CSV export.
+  `Fetch surface row data (display values as shown in the table UI). Fast — uses Clay's async CSV export, then in-process scans.
 
-USE WHEN: Showing data, checking fill rates, linking across tables, or finding a row's _rowId to pass to get_record.
+ACCEPTS EITHER tableId (from a prior sync_table call) OR url (Clay table URL — auto-syncs the schema if not cached). One is required; if both are passed, tableId wins.
+
+USE WHEN:
+  - "What's in this table" / fill rate / show me the data
+  - Find a specific entity by name / domain / email — pass query
+  - Restrict the search to one column — pass identifier_column with query
+  - Get a row's _rowId so you can follow up with get_record for the full nested JSON
 DON'T USE WHEN:
-  - Need nested JSON / provider raw response for a specific entity → use find_record.
-  - Need cell statuses (SUCCESS/ERROR/HAS_NOT_RUN) → use get_errors.
-RETURNS: JSON — { totalRows, returnedCount, rows: [...] }. When a query is provided, each row also has _rowId, _csvIndex, and matchedColumns. Without a query, no _rowId is included (use find_record or call again with a query to get one).`,
+  - You already have a _rowId and need raw provider JSON / credit cost / subroutine pointers → use get_record
+  - Cell statuses (SUCCESS/ERROR/HAS_NOT_RUN) across the table → use get_errors
+
+RETURNS: JSON — { totalRows, returnedCount, syncedAt, query, identifierColumn, rows: [...] }. When query is provided, each row has _rowId, _csvIndex, and matchedColumns; the caller picks the right match by column semantics. Without a query, rows are display values only and no _rowId is included.
+
+ESCALATION TO NESTED: when query returns exactly one match and the user wants the why/how (raw provider response, error payload, credit detail, subroutine origin pointers), follow up with get_record(tableId, rowId). The escalation is your call — there's no auto-fetch.`,
   {
-    tableId: z.string().describe('Table ID (t_...) from a previous sync_table call'),
-    limit: z.number().optional().default(20).describe('Max rows to return. Default 20. Use 1 when searching for a specific entity.'),
-    query: z.string().optional().describe('Substring match (case-insensitive) across all columns. Stops after finding limit matches.')
+    tableId: z.string().optional().describe('Table ID (t_...) from a previous sync_table call. Either tableId or url is required.'),
+    url:     z.string().optional().describe('Clay table URL (must contain /tables/t_...). Auto-syncs the schema if not already cached. Either tableId or url is required.'),
+    query:   z.string().optional().describe('Substring match (case-insensitive). Returns matches with _rowId and matchedColumns. Stops after finding limit matches.'),
+    identifier_column: z.string().optional().describe('Restrict the substring match to this column. Requires query. Omit to search all columns.'),
+    limit:   z.number().optional().default(20).describe('Max rows to return. Default 20. Use 1 when searching for a specific entity.'),
+    force_refresh: z.boolean().optional().default(false).describe('Re-fetch the CSV instead of using the session cache.')
   },
-  async ({ tableId, limit, query }) => {
+  async ({ tableId, url, query, identifier_column, limit, force_refresh }) => {
     try {
+      // Resolve tableId from url if needed, auto-syncing the schema.
+      if (!tableId && url) {
+        const parsed = parseClayUrl(url);
+        if (!parsed.tableId) {
+          return { content: [{ type: 'text', text: JSON.stringify({ error: 'URL must contain a table ID (t_...)' }) }], isError: true };
+        }
+        tableId = parsed.tableId;
+        if (!schemaCache.get(tableId)) {
+          const schema = await getTableSchema(tableId, parsed.viewId);
+          schemaCache.set(tableId, schema);
+        }
+      }
+      if (!tableId) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'Either tableId or url is required.' }) }], isError: true };
+      }
+
       const schema = getSchema(tableId);
-      const { csvRows, totalRows, syncedAt } = await getOrFetchRows(tableId);
+      const { headers, csvRows, totalRows, syncedAt } = await getOrFetchRows(tableId, { forceRefresh: force_refresh });
 
       if (csvRows.length === 0) {
-        return { content: [{ type: 'text', text: JSON.stringify({ totalRows: 0, returnedCount: 0, rows: [] }) }] };
+        return { content: [{ type: 'text', text: JSON.stringify({ totalRows: 0, returnedCount: 0, syncedAt, rows: [] }) }] };
+      }
+
+      if (identifier_column && !headers.includes(identifier_column)) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({
+            error: `Column "${identifier_column}" not found.`,
+            availableColumns: headers
+          }) }],
+          isError: true
+        };
       }
 
       let rows;
       if (query) {
-        const matches = searchCsvRows(csvRows, query, limit);
+        const matches = searchCsvRows(csvRows, query, limit, identifier_column || null);
         rows = [];
         for (const m of matches) {
           let rowId = null;
@@ -402,9 +442,10 @@ RETURNS: JSON — { totalRows, returnedCount, rows: [...] }. When a query is pro
       return {
         content: [{ type: 'text', text: JSON.stringify({
           totalRows,
-          returnedCount: rows.length,
+          returnedCount:    rows.length,
           syncedAt,
-          query: query ?? null,
+          query:            query ?? null,
+          identifierColumn: identifier_column ?? null,
           rows
         }, null, 2) }]
       };
@@ -420,13 +461,13 @@ RETURNS: JSON — { totalRows, returnedCount, rows: [...] }. When a query is pro
 
 server.tool(
   'get_record',
-  `Fetch one row's full nested JSON (externalContent/fullValue + status + per-cell credit usage). Low-level escape hatch.
+  `Fetch one row's full nested JSON (externalContent/fullValue + status + per-cell credit usage).
 
 USE WHEN:
-  - You already have a _rowId and need the raw provider response / nested objects / error payloads / credit cost.
+  - You have a _rowId (from get_rows with a query) and need the raw provider response / nested objects / error payloads / credit cost.
   - You are following a subroutine pointer from a prior record's fullContent.origin (tableId + recordId). Mandatory when tracing execution through functions.
 DON'T USE WHEN:
-  - Starting from an identifier value → use find_record (handles lookup + fetch).
+  - Starting from an identifier value → use get_rows with a query first to get the _rowId, then call this on the right match.
   - Surface display value would answer the question → use get_rows.
 RETURNS: JSON — { _rowId, _credits: { total, billedCellCount }, <columnName>: { value, status, fullContent, credits? }, ... }.
 COST: Expensive — one API call per row. Batch subroutine follow-ups in parallel.`,
@@ -445,130 +486,6 @@ COST: Expensive — one API call per row. Batch subroutine follow-ups in paralle
       };
     } catch (err) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: `Error fetching record: ${err.message}` }) }], isError: true };
-    }
-  }
-);
-
-// ---------------------------------------------------------------------------
-// Tool: find_record
-// ---------------------------------------------------------------------------
-
-server.tool(
-  'find_record',
-  `Substring-match across columns and auto-fetch the full record on a unique hit. Combines auto-sync + search + get_record in one call.
-
-USE WHEN: User names a specific entity (company, person, domain, email) and wants the raw provider response, the credit cost, or "why did X happen for Y?"
-DON'T USE WHEN:
-  - Surface display value would answer it → use get_rows.
-  - Broad "what's failing" question → use get_errors.
-
-BEHAVIOR:
-  - Auto-syncs the schema if not cached.
-  - Substring-matches the query across all columns (or only identifier_column if provided). No value-shape classification — YOU decide which match is "right" based on column semantics.
-  - Returns ALL matches with _rowId, _csvIndex, and matchedColumns.
-  - On EXACTLY ONE match: also fetches the full nested record JSON and includes it under 'record'.
-  - On MULTIPLE matches: returns the candidate list without fetching — pick a row and call get_record yourself, or refine via identifier_column.
-
-RETURNS: JSON — { totalRows, syncedAt, query, matches: [...], record? }.
-
-FOLLOW-UP REQUIRED: when 'record' is included, scan its cells for fullContent.origin.recordId — those are subroutine pointers and MUST be followed via get_record before reporting the execution trace. Run follow-ups in parallel, recurse up to 3 levels.`,
-  {
-    url: z.string().describe('Clay table URL (must contain /tables/t_...)'),
-    identifier_value: z.string().describe('The value to look up (e.g. "Acme Corp", "acme.com", "jane@acme.com")'),
-    identifier_column: z.string().optional().describe('Restrict the substring match to this column. Omit to search all columns.'),
-    force_refresh: z.boolean().optional().default(false).describe('Re-fetch the CSV instead of using the session cache.')
-  },
-  async ({ url, identifier_value, identifier_column, force_refresh }) => {
-    try {
-      const { tableId, viewId } = parseClayUrl(url);
-      if (!tableId) {
-        return { content: [{ type: 'text', text: JSON.stringify({ error: 'URL must contain a table ID (t_...)' }) }], isError: true };
-      }
-
-      let schema = schemaCache.get(tableId);
-      if (!schema) {
-        schema = await getTableSchema(tableId, viewId);
-        schemaCache.set(tableId, schema);
-      }
-
-      const { headers, csvRows, totalRows, syncedAt } = await getOrFetchRows(tableId, { forceRefresh: force_refresh });
-
-      if (csvRows.length === 0) {
-        return { content: [{ type: 'text', text: JSON.stringify({ totalRows: 0, syncedAt, query: identifier_value, matches: [] }) }] };
-      }
-
-      if (identifier_column && !headers.includes(identifier_column)) {
-        return {
-          content: [{ type: 'text', text: JSON.stringify({
-            error: `Column "${identifier_column}" not found.`,
-            availableColumns: headers
-          }) }],
-          isError: true
-        };
-      }
-
-      // Substring match across requested columns (all if not constrained).
-      const needle = String(identifier_value).toLowerCase();
-      const matches = [];
-      for (let i = 0; i < csvRows.length; i++) {
-        const row = csvRows[i];
-        const matchedColumns = [];
-        if (identifier_column) {
-          const val = row[identifier_column];
-          if (val != null && String(val).toLowerCase().includes(needle)) {
-            matchedColumns.push(identifier_column);
-          }
-        } else {
-          for (const [col, val] of Object.entries(row)) {
-            if (val != null && String(val).toLowerCase().includes(needle)) {
-              matchedColumns.push(col);
-            }
-          }
-        }
-        if (matchedColumns.length > 0) {
-          matches.push({ _csvIndex: i, matchedColumns, row });
-          if (matches.length > 50) break; // hard cap to keep payloads sane
-        }
-      }
-
-      // Resolve _rowId for every match (cheap — pagination call per index, memoized).
-      for (const m of matches) {
-        try { m._rowId = await resolveRowId(tableId, schema.viewId, m._csvIndex); }
-        catch { m._rowId = null; }
-      }
-
-      // Flatten match shape so each match looks like { _rowId, _csvIndex, matchedColumns, ...row }
-      const flatMatches = matches.map(m => ({
-        _rowId: m._rowId,
-        _csvIndex: m._csvIndex,
-        matchedColumns: m.matchedColumns,
-        ...m.row
-      }));
-
-      const result = {
-        totalRows,
-        syncedAt,
-        query: identifier_value,
-        identifier_column: identifier_column ?? null,
-        matchCount: flatMatches.length,
-        matches: flatMatches
-      };
-
-      // Auto-fetch the full record on a unique hit.
-      if (flatMatches.length === 1 && flatMatches[0]._rowId) {
-        try {
-          const record = await getRecord(tableId, flatMatches[0]._rowId);
-          result.record = formatRecord(record, schema);
-        } catch (err) {
-          result.recordError = err.message;
-        }
-      }
-
-      return {
-        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
-      };
-    } catch (err) {
-      return { content: [{ type: 'text', text: JSON.stringify({ error: `Error in find_record: ${err.message}` }) }], isError: true };
     }
   }
 );
@@ -698,7 +615,7 @@ server.tool(
 
 USE WHEN: User asks "what's failing", "why isn't this working", or wants a table-wide health check.
 DON'T USE WHEN:
-  - User named a specific row/entity → go straight to find_record.
+  - User named a specific row/entity → go straight to get_rows with a query, then get_record on the right match.
   - You just need display values → use get_rows.
 RETURNS: JSON — { rowsAnalyzed, columns: [{ fieldId, name, success, error, hasNotRun, queued, total, fillPct, errors: { msg: count } }] }.
 

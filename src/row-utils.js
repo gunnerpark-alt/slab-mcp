@@ -105,8 +105,12 @@ export function parseCsv(csvText) {
  * their CSV index and the columns whose values matched. The LLM decides
  * which match is the "right" one — no value-shape classification, no
  * column prioritization.
+ *
+ * If identifier_column is provided, only that column is searched; otherwise
+ * every column is searched and the matched columns are returned per row so
+ * the caller can pick the right hit by column semantics.
  */
-export function searchCsvRows(rows, query, limit) {
+export function searchCsvRows(rows, query, limit, identifier_column = null) {
   const needle = String(query).toLowerCase();
   if (!needle) return [];
 
@@ -114,9 +118,16 @@ export function searchCsvRows(rows, query, limit) {
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
     const matchedColumns = [];
-    for (const [col, val] of Object.entries(row)) {
+    if (identifier_column) {
+      const val = row[identifier_column];
       if (val != null && String(val).toLowerCase().includes(needle)) {
-        matchedColumns.push(col);
+        matchedColumns.push(identifier_column);
+      }
+    } else {
+      for (const [col, val] of Object.entries(row)) {
+        if (val != null && String(val).toLowerCase().includes(needle)) {
+          matchedColumns.push(col);
+        }
       }
     }
     if (matchedColumns.length > 0) {
