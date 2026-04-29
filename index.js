@@ -389,20 +389,31 @@ DATA tools:
   Specific named entity (display value is enough)           → get_rows with query
   Specific named entity (need raw JSON / why-it-failed)     → get_rows with query, then get_record on the right match
   Restrict the search to one column                         → get_rows with query + identifier_column
-  "Do any of these IDs / emails / values exist in the table" → find_rows (server-side match; returns _rowId per hit for get_record follow-up)
-  All rows needed, surface display values are sufficient    → export_csv (add columns= to project down wide tables)
+  User gives a list of IDs / emails / values to check       → find_rows ALWAYS — never export_csv for this, even with columns=; large tables will still blow the budget; find_rows is server-side and never hits the limit
+  All rows needed for analysis, surface values sufficient   → export_csv with columns= (project to only the columns you need)
   "What's broken" / "why are errors"                        → get_errors
   "Debug" / "investigate" a specific row or failing column  → get_errors to find a failing _rowId, then get_record on it, then follow every subroutine origin pointer (debugging without nested JSON is guessing)
   "How much does this table cost" / "avg credits per row"   → get_credits (no rowId, samples)
   "How much did row X cost" / "which column is expensive"   → get_credits with rowId
   Already have a _rowId, need raw nested JSON               → get_record
 
-find_rows vs export_csv vs get_rows — pick based on what you need:
-  "Which of these N values exist in column X?" + need _rowId → find_rows (server-side; raw data never crosses transport)
-  Need the actual data for all/most rows                     → export_csv; pass columns= to project wide tables down to the few columns you care about
-  Surface values for a FEW rows or a SPECIFIC entity         → get_rows with query (faster than a full export)
-  Cell status / error payload / nested JSON on any row       → get_rows or find_rows to get _rowId, then get_record
-  Prompt or formula optimization (need stepsTaken etc.)      → get_record on 1-3 representative rows — surface views say "Response", the actual model output is in fullContent only
+find_rows vs export_csv vs get_rows:
+
+  Pattern: "here is a list of values — which rows have them?"
+  → find_rows, ALWAYS. Not export_csv. Not get_rows in a loop.
+    find_rows downloads the table server-side, does the set intersection in Node, and returns only
+    { matches: [{value, _rowId, ...}], not_found: [] }. The raw table data never crosses the MCP
+    transport, so table size is irrelevant. export_csv with columns= will still fail on tables with
+    thousands of rows even if you ask for 2 columns.
+
+  Pattern: "show me / analyse the actual data across all rows"
+  → export_csv with columns= listing only the columns you need. Keeps response small.
+
+  Pattern: "find this one specific entity"
+  → get_rows with query. One server-side search call, no export needed.
+
+  Pattern: "why did this row fail / what did the AI return / trace subroutine"
+  → get_rows or find_rows to get _rowId, then get_record. Surface views hide nested data.
 
 get_rows accepts either tableId (from a prior sync_table) or url (auto-syncs the schema if not cached). Either is fine — pick whichever the user gave you.
 
@@ -805,15 +816,16 @@ server.tool(
   `Export all rows in a view as flat display values. Use for bulk operations where surface values are sufficient — membership checks, full-table scans, coverage analysis, or comparing a list of IDs against the table.
 
 USE WHEN:
-  - You need all (or most) rows and will scan, filter, or compare them in bulk
+  - You need all (or most) rows AND you will reason over the actual data values (e.g. summarising domains, showing sample rows, analysing patterns across the full dataset)
   - Display values visible in the Clay UI are enough — you do NOT need nested JSON, cell statuses, credit costs, or subroutine pointers
-  - Examples: checking whether a list of IDs exists in the table, enumerating all domains or emails in a column, finding rows matching a pattern across the full dataset
+  - Use the columns= parameter to project down to only the columns you need — this is the only way to make large tables fit
 
 DON'T USE WHEN:
-  - Searching for a specific entity by name/ID/email → get_rows with query is faster (one search call vs full export)
-  - You need to debug a failing row → need cell statuses + error payloads → get_errors + get_record
-  - You need to optimize or review a Claygent/AI prompt → stepsTaken, reasoning, sources are only in fullContent → get_record on 1-3 rows first
-  - You need to trace data flow across subroutine calls → fullContent.origin pointers → get_record
+  - You have a list of IDs / emails / values and want to know which ones exist in the table → use find_rows. Do NOT use export_csv for this — even with columns=, a table with thousands of rows will blow the response budget. find_rows does the intersection server-side and only returns matches + not_found.
+  - Searching for a single specific entity → get_rows with query is faster
+  - You need to debug a failing row → get_errors + get_record
+  - You need to optimize or review a Claygent/AI prompt → get_record on 1-3 rows first (surface values just say "Response")
+  - You need to trace data flow across subroutine calls → get_record
   - You need per-cell credit costs → get_credits
   - The question can be answered from schema alone → sync_table
 
