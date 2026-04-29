@@ -7,6 +7,8 @@
  *   sync_table     — Fetch a Clay table's schema + recursively-synced subroutines
  *   sync_workbook  — Discover all tables in a workbook and fetch their schemas
  *   get_rows       — List or search display values; accepts tableId or url; cheap
+ *   export_csv     — Export all rows as flat display values; pass columns= to project wide tables
+ *   find_rows      — Bulk membership check: given N values + a column, returns _rowId per match
  *   get_record     — Fetch one row's full nested JSON (expensive — one call per row)
  *   get_credits    — Credit cost for one row or aggregated across the table
  *   get_errors     — Per-column status counts (success / error / has-not-run / queued)
@@ -387,19 +389,20 @@ DATA tools:
   Specific named entity (display value is enough)           → get_rows with query
   Specific named entity (need raw JSON / why-it-failed)     → get_rows with query, then get_record on the right match
   Restrict the search to one column                         → get_rows with query + identifier_column
-  Bulk scan / does a list of values exist in the table      → export_csv (one call for all rows; compare locally)
-  All rows needed, surface display values are sufficient    → export_csv
+  "Do any of these IDs / emails / values exist in the table" → find_rows (server-side match; returns _rowId per hit for get_record follow-up)
+  All rows needed, surface display values are sufficient    → export_csv (add columns= to project down wide tables)
   "What's broken" / "why are errors"                        → get_errors
   "Debug" / "investigate" a specific row or failing column  → get_errors to find a failing _rowId, then get_record on it, then follow every subroutine origin pointer (debugging without nested JSON is guessing)
   "How much does this table cost" / "avg credits per row"   → get_credits (no rowId, samples)
   "How much did row X cost" / "which column is expensive"   → get_credits with rowId
   Already have a _rowId, need raw nested JSON               → get_record
 
-export_csv vs get_rows — pick based on what you need:
-  Surface values for ALL rows (bulk, no specific target)    → export_csv
-  Surface values for a FEW rows or a SPECIFIC entity        → get_rows (query is faster than a full export)
-  Cell status / error payload / nested JSON on any row      → get_rows to get _rowId, then get_record
-  Prompt or formula optimization (need stepsTaken etc.)     → get_record on 1-3 representative rows — export_csv shows only "Response" placeholders for action columns, which tells you nothing
+find_rows vs export_csv vs get_rows — pick based on what you need:
+  "Which of these N values exist in column X?" + need _rowId → find_rows (server-side; raw data never crosses transport)
+  Need the actual data for all/most rows                     → export_csv; pass columns= to project wide tables down to the few columns you care about
+  Surface values for a FEW rows or a SPECIFIC entity         → get_rows with query (faster than a full export)
+  Cell status / error payload / nested JSON on any row       → get_rows or find_rows to get _rowId, then get_record
+  Prompt or formula optimization (need stepsTaken etc.)      → get_record on 1-3 representative rows — surface views say "Response", the actual model output is in fullContent only
 
 get_rows accepts either tableId (from a prior sync_table) or url (auto-syncs the schema if not cached). Either is fine — pick whichever the user gave you.
 
@@ -824,9 +827,10 @@ RETURNS: { totalRows, returnedCount, truncated, view, columns, rows: [{ <colName
   {
     tableId: z.string().optional().describe('Table ID (t_...) from a prior sync_table call. Either tableId or url is required.'),
     url:     z.string().optional().describe('Clay table URL — auto-syncs the schema if not cached. Either tableId or url is required.'),
-    view:    z.string().optional().describe('View id (gv_*) or view name ("All rows", "Errored rows", etc.). Default: the view picked at sync time.')
+    view:    z.string().optional().describe('View id (gv_*) or view name ("All rows", "Errored rows", etc.). Default: the view picked at sync time.'),
+    columns: z.array(z.string()).optional().describe('Allowlist of column names to include in each row. Omit to return all columns. Use this to reduce response size on wide tables — e.g. ["Account ID", "Final Account ID", "Domain"] instead of all 50 columns.')
   },
-  async ({ tableId, url, view }) => {
+  async ({ tableId, url, view, columns }) => {
     try {
       if (!tableId && url) {
         const parsed = parseClayUrl(url);
@@ -857,7 +861,18 @@ RETURNS: { totalRows, returnedCount, truncated, view, columns, rows: [{ <colName
 
       const { downloadUrl, totalRows } = await exportTableToCsv(tableId, viewId);
       const csvText = await fetchCsv(downloadUrl);
-      const { headers, rows } = parseCsv(csvText);
+      let { headers, rows } = parseCsv(csvText);
+
+      // Column projection — filter before size estimation
+      if (columns && columns.length > 0) {
+        const keep = new Set(columns);
+        headers = headers.filter(h => keep.has(h));
+        rows = rows.map(r => {
+          const projected = {};
+          for (const h of headers) projected[h] = r[h] ?? null;
+          return projected;
+        });
+      }
 
       // Truncate to fit MCP response budget
       let truncated = false;
@@ -876,7 +891,7 @@ RETURNS: { totalRows, returnedCount, truncated, view, columns, rows: [{ <colName
           returnedCount: returnedRows.length,
           truncated:    truncated || undefined,
           truncatedWarning: truncated
-            ? `Result was cut from ${rows.length} to ${returnedRows.length} rows to fit the MCP response budget. Use get_rows with query + identifier_column to search specific values instead.`
+            ? `Result was cut from ${rows.length} to ${returnedRows.length} rows to fit the MCP response budget. Pass 'columns' to project down to the columns you need, or use find_rows for a membership check.`
             : undefined,
           view:    viewId,
           columns: headers,
@@ -885,6 +900,158 @@ RETURNS: { totalRows, returnedCount, truncated, view, columns, rows: [{ <colName
       };
     } catch (err) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: `Error exporting CSV: ${err.message}` }) }], isError: true };
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: find_rows
+// ---------------------------------------------------------------------------
+
+server.tool(
+  'find_rows',
+  `Check which values from a list exist in a specific column, and return the _rowId for every match so you can call get_record on them.
+
+USE WHEN:
+  - You have a list of IDs, emails, domains, or any values and need to know which ones have a corresponding row in the table
+  - You need the _rowId for matched rows so you can follow up with get_record for deeper debugging
+  - The table is too wide for export_csv to fit in the response budget — find_rows processes everything server-side and only returns the filtered result
+
+DON'T USE WHEN:
+  - Searching for a single value → get_rows with query is simpler
+  - You need the actual data for all rows (not just matches) → export_csv with columns projection
+  - You need nested JSON on matched rows right now → use find_rows to get _rowIds, then get_record in parallel
+
+HOW IT WORKS: Downloads all rows via the records API, does the set intersection server-side, returns only the result. The raw table data never crosses the MCP transport — only matched rows come back.
+
+RETURNS:
+  {
+    column,           // column that was searched
+    searched,         // total values you passed in (including dupes)
+    uniqueSearched,   // deduplicated count
+    matchedCount,     // rows found
+    notFoundCount,    // values with no matching row
+    totalRowsScanned, // how many rows the table had
+    matches: [{ value, _rowId, ...return_columns }],
+    not_found: [value, ...]
+  }
+
+  _rowId on each match is the row ID you pass to get_record(tableId, _rowId) to pull full nested JSON.`,
+  {
+    tableId:        z.string().optional().describe('Table ID (t_...) from a prior sync_table call. Either tableId or url is required.'),
+    url:            z.string().optional().describe('Clay table URL — auto-syncs the schema if not cached. Either tableId or url is required.'),
+    view:           z.string().optional().describe('View id (gv_*) or view name. Default: the view picked at sync time.'),
+    column:         z.string().describe('Column name to match against. Must be an exact column name as it appears in the table.'),
+    values:         z.array(z.string()).describe('List of values to look for. Matching is exact and case-sensitive. Duplicates are deduped automatically.'),
+    return_columns: z.array(z.string()).optional().describe('Extra columns to include on each matched row alongside _rowId. Useful for quick context without a separate get_record call — e.g. ["Domain", "Final Account ID", "Create Account?"].')
+  },
+  async ({ tableId, url, view, column, values, return_columns }) => {
+    try {
+      if (!tableId && url) {
+        const parsed = parseClayUrl(url);
+        if (!parsed.tableId) {
+          return { content: [{ type: 'text', text: JSON.stringify({ error: 'URL must contain a table ID (t_...)' }) }], isError: true };
+        }
+        tableId = parsed.tableId;
+        if (!schemaCache.get(tableId)) {
+          const schema = await getTableSchema(tableId, parsed.viewId);
+          schemaCache.set(tableId, schema);
+        }
+      }
+      if (!tableId) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'Either tableId or url is required.' }) }], isError: true };
+      }
+
+      const schema = getSchema(tableId);
+      const viewId = resolveViewId(schema, view);
+      if (view && !viewId) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({
+            error: `View "${view}" not found.`,
+            availableViews: (schema.views || []).map(v => ({ id: v.id, name: v.name }))
+          }) }],
+          isError: true
+        };
+      }
+
+      // Build fieldId maps
+      const fieldIdByName = {};
+      const columnMap = {};
+      for (const f of schema.fields) {
+        fieldIdByName[f.name] = f.id;
+        columnMap[f.id] = f.name;
+      }
+
+      const targetFieldId = fieldIdByName[column];
+      if (!targetFieldId) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({
+            error: `Column "${column}" not found.`,
+            availableColumns: schema.fields.map(f => f.name)
+          }) }],
+          isError: true
+        };
+      }
+
+      // Validate return_columns early
+      const extraFieldIds = [];
+      if (return_columns && return_columns.length > 0) {
+        for (const col of return_columns) {
+          const fid = fieldIdByName[col];
+          if (!fid) {
+            return {
+              content: [{ type: 'text', text: JSON.stringify({
+                error: `return_columns: column "${col}" not found.`,
+                availableColumns: schema.fields.map(f => f.name)
+              }) }],
+              isError: true
+            };
+          }
+          extraFieldIds.push({ col, fid });
+        }
+      }
+
+      // Dedupe the search values
+      const uniqueValues = [...new Set(values.map(String))];
+      const valueSet = new Set(uniqueValues);
+
+      // Fetch all rows server-side — _rowId lives on record.id
+      const records = await getAllRecords(tableId, viewId);
+
+      const matches = [];
+      const foundValues = new Set();
+
+      for (const record of records) {
+        const cells = record.cells || {};
+        const cellValue = cells[targetFieldId]?.value;
+        if (cellValue == null) continue;
+        const strValue = String(cellValue);
+        if (!valueSet.has(strValue)) continue;
+
+        const match = { value: strValue, _rowId: record.id };
+        for (const { col, fid } of extraFieldIds) {
+          match[col] = cells[fid]?.value ?? null;
+        }
+        matches.push(match);
+        foundValues.add(strValue);
+      }
+
+      const not_found = uniqueValues.filter(v => !foundValues.has(v));
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify({
+          column,
+          searched:         values.length,
+          uniqueSearched:   uniqueValues.length,
+          matchedCount:     matches.length,
+          notFoundCount:    not_found.length,
+          totalRowsScanned: records.length,
+          matches,
+          not_found
+        }, null, 2) }]
+      };
+    } catch (err) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: `Error in find_rows: ${err.message}` }) }], isError: true };
     }
   }
 );
