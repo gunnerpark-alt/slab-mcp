@@ -23,7 +23,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 
-import { getTableSchema, listRows, getRecord, getWorkbookTables, getAllRecords, searchRecords, RECORDS_API_CAP } from './src/clay-api.js';
+import { getTableSchema, listRows, getRecord, getWorkbookTables, getAllRecords, searchRecords, exportTableToCsv, fetchCsv, RECORDS_API_CAP } from './src/clay-api.js';
 import { analyzeRowStatuses, formatRecord } from './src/row-utils.js';
 
 // ---------------------------------------------------------------------------
@@ -306,6 +306,65 @@ async function rollupCredits(tableId, rowId, depth, maxDepth, visited) {
 }
 
 // ---------------------------------------------------------------------------
+// CSV parser (handles quoted fields and embedded newlines)
+// ---------------------------------------------------------------------------
+
+function parseCsv(text) {
+  const rows = [];
+  let i = 0;
+  const n = text.length;
+
+  function parseField() {
+    if (i < n && text[i] === '"') {
+      i++;
+      let field = '';
+      while (i < n) {
+        if (text[i] === '"') {
+          if (text[i + 1] === '"') { field += '"'; i += 2; }
+          else { i++; break; }
+        } else {
+          field += text[i++];
+        }
+      }
+      return field;
+    }
+    let field = '';
+    while (i < n && text[i] !== ',' && text[i] !== '\n' && text[i] !== '\r') {
+      field += text[i++];
+    }
+    return field;
+  }
+
+  function parseRow() {
+    const fields = [];
+    while (true) {
+      fields.push(parseField());
+      if (i >= n || text[i] === '\n' || text[i] === '\r') {
+        if (i < n && text[i] === '\r') i++;
+        if (i < n && text[i] === '\n') i++;
+        break;
+      }
+      i++; // skip comma
+    }
+    return fields;
+  }
+
+  while (i < n) {
+    const row = parseRow();
+    if (row.length > 1 || row[0] !== '') rows.push(row);
+  }
+
+  if (rows.length === 0) return { headers: [], rows: [] };
+  const headers = rows[0];
+  const dataRows = rows.slice(1).map(values => {
+    const obj = {};
+    for (let j = 0; j < headers.length; j++) obj[headers[j]] = values[j] ?? null;
+    return obj;
+  });
+  return { headers, rows: dataRows };
+}
+
+// ---------------------------------------------------------------------------
 // MCP server
 // ---------------------------------------------------------------------------
 
@@ -328,11 +387,19 @@ DATA tools:
   Specific named entity (display value is enough)           → get_rows with query
   Specific named entity (need raw JSON / why-it-failed)     → get_rows with query, then get_record on the right match
   Restrict the search to one column                         → get_rows with query + identifier_column
+  Bulk scan / does a list of values exist in the table      → export_csv (one call for all rows; compare locally)
+  All rows needed, surface display values are sufficient    → export_csv
   "What's broken" / "why are errors"                        → get_errors
   "Debug" / "investigate" a specific row or failing column  → get_errors to find a failing _rowId, then get_record on it, then follow every subroutine origin pointer (debugging without nested JSON is guessing)
   "How much does this table cost" / "avg credits per row"   → get_credits (no rowId, samples)
   "How much did row X cost" / "which column is expensive"   → get_credits with rowId
   Already have a _rowId, need raw nested JSON               → get_record
+
+export_csv vs get_rows — pick based on what you need:
+  Surface values for ALL rows (bulk, no specific target)    → export_csv
+  Surface values for a FEW rows or a SPECIFIC entity        → get_rows (query is faster than a full export)
+  Cell status / error payload / nested JSON on any row      → get_rows to get _rowId, then get_record
+  Prompt or formula optimization (need stepsTaken etc.)     → get_record on 1-3 representative rows — export_csv shows only "Response" placeholders for action columns, which tells you nothing
 
 get_rows accepts either tableId (from a prior sync_table) or url (auto-syncs the schema if not cached). Either is fine — pick whichever the user gave you.
 
@@ -722,6 +789,102 @@ ESCALATION TO NESTED: when query returns exactly one match and the user wants th
       };
     } catch (err) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: `Error fetching rows: ${err.message}` }) }], isError: true };
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: export_csv
+// ---------------------------------------------------------------------------
+
+server.tool(
+  'export_csv',
+  `Export all rows in a view as flat display values. Use for bulk operations where surface values are sufficient — membership checks, full-table scans, coverage analysis, or comparing a list of IDs against the table.
+
+USE WHEN:
+  - You need all (or most) rows and will scan, filter, or compare them in bulk
+  - Display values visible in the Clay UI are enough — you do NOT need nested JSON, cell statuses, credit costs, or subroutine pointers
+  - Examples: checking whether a list of IDs exists in the table, enumerating all domains or emails in a column, finding rows matching a pattern across the full dataset
+
+DON'T USE WHEN:
+  - Searching for a specific entity by name/ID/email → get_rows with query is faster (one search call vs full export)
+  - You need to debug a failing row → need cell statuses + error payloads → get_errors + get_record
+  - You need to optimize or review a Claygent/AI prompt → stepsTaken, reasoning, sources are only in fullContent → get_record on 1-3 rows first
+  - You need to trace data flow across subroutine calls → fullContent.origin pointers → get_record
+  - You need per-cell credit costs → get_credits
+  - The question can be answered from schema alone → sync_table
+
+COST: async — kicks off a Clay export job, polls until done (~1-5s for small tables, up to 5 min for very large), downloads the result once. One network round-trip regardless of table size. For small tables (under a few hundred rows), get_rows without a query may be faster.
+
+VIEW SELECTION: same rules as get_rows. Pass 'view' by id (gv_*) or name to scope to a filtered view (e.g. "Errored rows").
+
+RETURNS: { totalRows, returnedCount, truncated, view, columns, rows: [{ <colName>: <displayValue>, ... }] }
+  - totalRows: count reported by the export job
+  - truncated: true if the parsed result was cut to fit the MCP response budget (~900KB); a warning explains how many rows were dropped`,
+  {
+    tableId: z.string().optional().describe('Table ID (t_...) from a prior sync_table call. Either tableId or url is required.'),
+    url:     z.string().optional().describe('Clay table URL — auto-syncs the schema if not cached. Either tableId or url is required.'),
+    view:    z.string().optional().describe('View id (gv_*) or view name ("All rows", "Errored rows", etc.). Default: the view picked at sync time.')
+  },
+  async ({ tableId, url, view }) => {
+    try {
+      if (!tableId && url) {
+        const parsed = parseClayUrl(url);
+        if (!parsed.tableId) {
+          return { content: [{ type: 'text', text: JSON.stringify({ error: 'URL must contain a table ID (t_...)' }) }], isError: true };
+        }
+        tableId = parsed.tableId;
+        if (!schemaCache.get(tableId)) {
+          const schema = await getTableSchema(tableId, parsed.viewId);
+          schemaCache.set(tableId, schema);
+        }
+      }
+      if (!tableId) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'Either tableId or url is required.' }) }], isError: true };
+      }
+
+      const schema = getSchema(tableId);
+      const viewId = resolveViewId(schema, view);
+      if (view && !viewId) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({
+            error: `View "${view}" not found.`,
+            availableViews: (schema.views || []).map(v => ({ id: v.id, name: v.name }))
+          }) }],
+          isError: true
+        };
+      }
+
+      const { downloadUrl, totalRows } = await exportTableToCsv(tableId, viewId);
+      const csvText = await fetchCsv(downloadUrl);
+      const { headers, rows } = parseCsv(csvText);
+
+      // Truncate to fit MCP response budget
+      let truncated = false;
+      let returnedRows = rows;
+      const sizeEstimate = JSON.stringify({ headers, rows }).length;
+      if (sizeEstimate > MCP_RESPONSE_MAX_BYTES) {
+        const ratio = MCP_RESPONSE_MAX_BYTES / sizeEstimate;
+        const safeCount = Math.floor(rows.length * ratio * 0.9);
+        returnedRows = rows.slice(0, safeCount);
+        truncated = true;
+      }
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify({
+          totalRows:    totalRows ?? rows.length,
+          returnedCount: returnedRows.length,
+          truncated:    truncated || undefined,
+          truncatedWarning: truncated
+            ? `Result was cut from ${rows.length} to ${returnedRows.length} rows to fit the MCP response budget. Use get_rows with query + identifier_column to search specific values instead.`
+            : undefined,
+          view:    viewId,
+          columns: headers,
+          rows:    returnedRows
+        }, null, 2) }]
+      };
+    } catch (err) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: `Error exporting CSV: ${err.message}` }) }], isError: true };
     }
   }
 );

@@ -185,6 +185,49 @@ export async function searchRecords(tableId, viewId, searchTerm) {
 }
 
 /**
+ * Export a view to CSV via an async job.
+ * Returns { downloadUrl, totalRows }.
+ * One round-trip regardless of table size — faster than paginated listRows for full-table reads.
+ * CSV contains display values only — no cell statuses, credit data, or nested JSON.
+ */
+export async function exportTableToCsv(tableId, viewId) {
+  if (!viewId) viewId = await getDefaultViewId(tableId);
+  if (!viewId) throw new Error('No view ID — pass one in the URL or ensure the table has a default view');
+
+  const job = await clayPost(`/tables/${tableId}/views/${viewId}/export`);
+  const jobId = job.id;
+  if (!jobId) throw new Error('Export job creation failed — no ID in response');
+
+  const pollIntervalMs = 1200;
+  const maxWaitMs = 5 * 60 * 1000;
+  const startedAt = Date.now();
+
+  while (true) {
+    await new Promise(r => setTimeout(r, pollIntervalMs));
+    const status = await clayRequest(`/exports/${jobId}`);
+
+    if (status.status === 'FINISHED') {
+      return { downloadUrl: status.downloadUrl, totalRows: status.recordsExportedCount ?? null };
+    }
+    if (status.status === 'FAILED' || status.status === 'CANCELLED') {
+      throw new Error(`Export job ${jobId} ended with status: ${status.status}`);
+    }
+    if (Date.now() - startedAt > maxWaitMs) {
+      throw new Error(`Export job ${jobId} timed out after ${maxWaitMs / 1000}s`);
+    }
+  }
+}
+
+/**
+ * Download CSV text from a signed S3 URL returned by exportTableToCsv.
+ */
+export async function fetchCsv(downloadUrl) {
+  const res = await fetch(downloadUrl);
+  if (!res.ok) throw new Error(`Failed to download CSV: ${res.status}`);
+  return res.text();
+}
+
+/**
  * List all tables in a workbook.
  */
 export async function getWorkbookTables(workbookId) {
