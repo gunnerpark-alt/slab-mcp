@@ -25,7 +25,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 
-import { getTableSchema, listRows, getRecord, getWorkbookTables, getAllRecords, searchRecords, exportTableToCsv, fetchCsv, RECORDS_API_CAP } from './src/clay-api.js';
+import { getTableSchema, listRows, getRecord, getWorkbookTables, getAllRecords, getRecordIds, bulkFetchRecords, searchRecords, exportTableToCsv, fetchCsv, RECORDS_API_CAP } from './src/clay-api.js';
 import { analyzeRowStatuses, formatRecord } from './src/row-utils.js';
 
 // ---------------------------------------------------------------------------
@@ -68,28 +68,39 @@ function buildColumnMap(schema) {
 }
 
 /**
- * Detect columns that invoke another table as a function (Clay's "subroutine").
- * Returns [{ columnName, subroutineTableId, sourceId }, ...].
- * The subroutine's tableId is embedded as a string literal in inputsBinding.
+ * Detect columns that link to another table: subroutines (execute-subroutine),
+ * row routing (route-row), and cross-table lookups (lookup-multiple-rows-in-other-table).
+ * Returns [{ columnName, linkedTableId, linkType, sourceId }, ...].
+ * The target tableId is embedded as a string literal in inputsBinding.
  */
-function detectSubroutineCalls(schema) {
-  const calls = [];
+const CROSS_TABLE_ACTION_KEYS = new Set([
+  'execute-subroutine',
+  'route-row',
+  'lookup-multiple-rows-in-other-table'
+]);
+
+function detectCrossTableLinks(schema) {
+  const links = [];
   for (const f of schema.fields || []) {
     if (f.type !== 'action') continue;
-    if (f.typeSettings?.actionKey !== 'execute-subroutine') continue;
+    const actionKey = f.typeSettings?.actionKey;
+    if (!CROSS_TABLE_ACTION_KEYS.has(actionKey)) continue;
 
     const binding = f.typeSettings.inputsBinding || [];
-    const tableIdEntry = binding.find(b => b.name === 'tableId');
+    const tableIdEntry  = binding.find(b => b.name === 'tableId');
     const sourceIdEntry = binding.find(b => b.name === 'sourceId');
 
-    const subroutineTableId = tableIdEntry?.formulaText?.replace(/^"|"$/g, '') || null;
-    const sourceId = sourceIdEntry?.formulaText?.replace(/^"|"$/g, '') || null;
+    const linkedTableId = tableIdEntry?.formulaText?.replace(/^"|"$/g, '') || null;
+    const sourceId      = sourceIdEntry?.formulaText?.replace(/^"|"$/g, '') || null;
 
-    if (subroutineTableId && /^t_[a-zA-Z0-9]+$/.test(subroutineTableId)) {
-      calls.push({ columnName: f.name, subroutineTableId, sourceId });
+    if (linkedTableId && /^t_[a-zA-Z0-9]+$/.test(linkedTableId)) {
+      const linkType = actionKey === 'execute-subroutine' ? 'subroutine'
+                     : actionKey === 'route-row'          ? 'route-row'
+                     :                                      'lookup';
+      links.push({ columnName: f.name, linkedTableId, linkType, sourceId });
     }
   }
-  return calls;
+  return links;
 }
 
 /**
@@ -124,12 +135,13 @@ async function syncTableRecursive(tableId, viewId, {
 
     if (depth >= maxDepth) return;
 
-    for (const call of detectSubroutineCalls(schema)) {
-      if (!visited.has(call.subroutineTableId)) {
-        await visit(call.subroutineTableId, null, depth + 1, {
+    for (const call of detectCrossTableLinks(schema)) {
+      if (!visited.has(call.linkedTableId)) {
+        await visit(call.linkedTableId, null, depth + 1, {
           tableId:    id,
           tableName:  schema.tableName,
-          columnName: call.columnName
+          columnName: call.columnName,
+          linkType:   call.linkType
         });
       }
     }
@@ -451,8 +463,11 @@ Identifier matching (get_rows with query):
   Substring match runs across all columns by default; pass identifier_column to scope to one column. Each match has a 'matchedColumns' list. YOU decide which match is the right one based on column semantics — e.g., a value with "@" most likely belongs in an Email column, a value with "https://" in a URL column. Don't expect the script to disambiguate.
 
 Column health (get_errors):
-  Returned per column: { success, error, hasNotRun, queued, total, fillPct, errors: { msg: count } }.
-  A column with success=0 and error>0 is broken — UNLESS its top error is "Run condition not met" or similar, in which case it's intentionally gated. Always check the column's run condition in the schema before calling a column "broken." Don't assume; read the typeSettings.conditionalRunFormulaText.
+  Returned per column: { filled, success, noData, error, hasNotRun, queued, total, fillPct, topErrors }.
+  filled   = ran AND returned a non-empty value. fillPct = filled / total.
+  success  = ran without error (superset of filled — includes cells that returned empty string / [] / {}).
+  noData   = SUCCESS_NO_DATA: provider ran but found no result. Not an error, but also not a fill.
+  A column with success=0 and error>0 is broken — UNLESS its top error is "Run condition not met" or similar, in which case it's intentionally gated. A column with high noData is NOT broken — the enrichment ran successfully but the target couldn't be found. Always check the column's run condition in the schema before calling a column "broken." Don't assume; read the typeSettings.conditionalRunFormulaText.
 
 Subroutine tracing (CRITICAL):
   When a record cell has fullContent.origin.recordId + fullContent.origin.tableId, that cell is the OUTPUT of a function execution and origin is a POINTER to the row that ran. You have NOT finished tracing execution until you've called get_record(origin.tableId, origin.recordId) for EVERY such cell. The parent row tells you a function "succeeded" with a display value; the child row reveals what actually happened — which provider in the waterfall ran, which inputs the parent passed in, which run conditions gated. Run follow-up get_records in parallel. Recurse up to 3 levels deep. Stop when no origin, when origin points to a table you already followed in this query, or at depth 3.
@@ -460,8 +475,8 @@ Subroutine tracing (CRITICAL):
 Schema reading:
   sync_table returns the full schema including each field's complete typeSettings (full formula text, full prompt text, full inputsBinding, run conditions). Read these directly — there's no truncation. Action fields also include 'pricing' with credit cost per run (basic, actionExecution, plus pre/post-2026 pricing).
 
-Subroutines in schemas:
-  sync_table returns 'subroutines' as an array of fully-synced child schemas (depth ≤ 3, max 20 tables). Each entry has invokedBy = { tableId, tableName, columnName } so you can wire the call graph back together. To explain what a parent table actually does, READ THE SUBROUTINE SCHEMAS — the parent says WHICH function runs, the function says HOW.
+Cross-table links in schemas:
+  sync_table returns 'subroutines' as an array of fully-synced linked-table schemas (depth ≤ 3, max 20 tables). This array covers ALL three connection types: execute-subroutine, route-row, and lookup-multiple-rows-in-other-table. Each entry has invokedBy = { tableId, tableName, columnName, linkType } so you can wire the full cross-table graph. linkType values: "subroutine" (the table runs as a function and returns data back to the parent), "route-row" (rows are forwarded to the target table), "lookup" (rows are looked up from the target table). To explain what a parent table does, READ THE LINKED SCHEMAS — the parent says WHICH table is connected, the linked schema says HOW.
 
 Credits:
   get_record returns per-cell credits.{ total, upfront, additional, aiProviderCost } when the cell consumed credits, and a row-level _credits.{ total, billedCellCount } summary. AI cells additionally disclose the underlying OpenAI/Anthropic dollar cost via aiProviderCost.
@@ -485,9 +500,11 @@ server.tool(
 
 USE WHEN: URL contains /tables/ (and not /workbooks/).
 DON'T USE WHEN: URL contains /workbooks/ → use sync_workbook.
-RETURNS: JSON object — { rootSchema: { tableId, viewId, tableName, rowCount, fieldCount, views, fields }, subroutines: [{ tableId, depth, invokedBy, schema }] }.
+RETURNS: JSON object — { rootSchema: { tableId, viewId, tableName, rowCount, fieldCount, views, fields }, subroutines: [{ tableId, depth, invokedBy: { tableId, tableName, columnName, linkType }, schema }] }.
 
-Each field includes full typeSettings (formula text, prompts, inputsBinding, run conditions) and 'pricing' on action fields. Read these directly — nothing is truncated.`,
+Each field includes full typeSettings (formula text, prompts, inputsBinding, run conditions) and 'pricing' on action fields. Read these directly — nothing is truncated. Fields may also include dataType, children (output sub-field shapes), and extractedFrom (which upstream field this derives from) when the table has schema-v2 data.
+
+subroutines includes all cross-table connections: execute-subroutine (linkType="subroutine"), route-row (linkType="route-row"), and lookup-multiple-rows-in-other-table (linkType="lookup"). invokedBy.linkType tells you which connection type each entry represents.`,
   { url: z.string().describe('Clay table URL, e.g. https://app.clay.com/tables/t_xxx/views/gv_yyy') },
   async ({ url }) => {
     const { tableId, viewId } = parseClayUrl(url);
@@ -549,23 +566,23 @@ MANIFEST FALLBACK: when the full payload would exceed the MCP transport budget (
       const externalById = new Map();
 
       for (const schema of schemas) {
-        for (const call of detectSubroutineCalls(schema)) {
-          if (workbookTableIds.has(call.subroutineTableId)) continue;
-          if (externalById.has(call.subroutineTableId)) {
-            externalById.get(call.subroutineTableId).invokedBy.push({
-              tableName: schema.tableName, columnName: call.columnName
+        for (const call of detectCrossTableLinks(schema)) {
+          if (workbookTableIds.has(call.linkedTableId)) continue;
+          if (externalById.has(call.linkedTableId)) {
+            externalById.get(call.linkedTableId).invokedBy.push({
+              tableName: schema.tableName, columnName: call.columnName, linkType: call.linkType
             });
             continue;
           }
           if (externalById.size >= 20) break;
           try {
             const { rootSchema: subSchema, subroutines: nested } = await syncTableRecursive(
-              call.subroutineTableId, null, { maxDepth: 2, maxTotal: 10 }
+              call.linkedTableId, null, { maxDepth: 2, maxTotal: 10 }
             );
-            externalById.set(call.subroutineTableId, {
-              tableId: call.subroutineTableId,
+            externalById.set(call.linkedTableId, {
+              tableId: call.linkedTableId,
               schema: subSchema,
-              invokedBy: [{ tableName: schema.tableName, columnName: call.columnName }]
+              invokedBy: [{ tableName: schema.tableName, columnName: call.columnName, linkType: call.linkType }]
             });
             for (const nestedEntry of nested) {
               if (workbookTableIds.has(nestedEntry.tableId)) continue;
@@ -577,10 +594,10 @@ MANIFEST FALLBACK: when the full payload would exceed the MCP transport budget (
               });
             }
           } catch (err) {
-            externalById.set(call.subroutineTableId, {
-              tableId: call.subroutineTableId,
+            externalById.set(call.linkedTableId, {
+              tableId: call.linkedTableId,
               schema: null,
-              invokedBy: [{ tableName: schema.tableName, columnName: call.columnName }],
+              invokedBy: [{ tableName: schema.tableName, columnName: call.columnName, linkType: call.linkType }],
               error: err.message
             });
           }
@@ -1027,8 +1044,9 @@ RETURNS:
       const uniqueValues = [...new Set(values.map(String))];
       const valueSet = new Set(uniqueValues);
 
-      // Fetch all rows server-side — _rowId lives on record.id
-      const records = await getAllRecords(tableId, viewId);
+      // Fetch all rows server-side via IDs + bulk-fetch to bypass the 20k records-API cap.
+      const recordIds = await getRecordIds(tableId, viewId);
+      const records = await bulkFetchRecords(tableId, recordIds, []);
 
       const matches = [];
       const foundValues = new Set();
@@ -1259,9 +1277,15 @@ DON'T USE WHEN:
 
 VIEW SELECTION: by default uses the view picked at sync time. Pass 'view' to scope to a different view by id (gv_*) or name. POWER MOVE: passing view="Errored rows" (when a Clay table has that saved view) makes get_errors much faster and more focused — it counts statuses only across rows that already have errors, instead of paging the whole table.
 
-RETURNS: JSON — { rowsAnalyzed, view, columns: [{ fieldId, name, success, error, hasNotRun, queued, total, fillPct, topErrors, errorCount }] }.
+RETURNS: JSON — { rowsAnalyzed, view, columns: [{ fieldId, name, filled, success, noData, error, hasNotRun, queued, total, fillPct, topErrors, errorCount }] }.
 
-INTERPRETATION: a column with success=0 and error>0 is broken UNLESS its top error is "Run condition not met" (gated, not broken). Always cross-reference with the column's run condition in the schema before calling something broken.`,
+Column fields:
+  filled    — rows where status=SUCCESS AND the value is non-empty/non-null/non-[]/non-{}
+  success   — rows where status=SUCCESS (superset of filled; includes empty-value cells)
+  noData    — rows where status=SUCCESS_NO_DATA: provider ran but found nothing (not an error, not a value)
+  fillPct   — filled / total (not success / total — noData and empty cells correctly reduce fill %)
+
+INTERPRETATION: a column with success=0 and error>0 is broken UNLESS its top error is "Run condition not met" (gated, not broken). Always cross-reference with the column's run condition in the schema before calling something broken. A column with high noData means the enrichment provider ran but consistently couldn't find a result — different from an error, but also not a fill.`,
   {
     tableId: z.string().describe('Table ID (t_...) from a previous sync_table call'),
     view:    z.string().optional().describe('View id (gv_*) or view name ("Errored rows", "All rows", etc.) to scope the count. Default: the view picked at sync time.')
@@ -1280,9 +1304,12 @@ INTERPRETATION: a column with success=0 and error>0 is broken UNLESS its top err
         };
       }
 
-      const rows = await listRows(tableId, viewId);
-      const truncated = rows.length >= RECORDS_API_CAP && (schema.rowCount ?? 0) > RECORDS_API_CAP
-        ? `View has ${schema.rowCount} rows; analysis covers only the first ${RECORDS_API_CAP} (Clay's records API caps a single read at that size and ignores pagination params). Counts are from a partial sample — use a saved filter view (e.g. "Errored rows") to scope under the cap for full coverage.`
+      // Use IDs + bulk-fetch to bypass the 20k records-API cap.
+      // includeExternalContentFieldIds=[] skips nested JSON — status and value are enough.
+      const recordIds = await getRecordIds(tableId, viewId);
+      const rows = await bulkFetchRecords(tableId, recordIds, []);
+      const truncated = (schema.rowCount != null && rows.length < schema.rowCount)
+        ? `View has ${schema.rowCount} rows but only ${rows.length} were returned. Counts are from a partial dataset — use a saved filter view (e.g. "Errored rows") to scope under the cap for full coverage.`
         : null;
       const columnMap = buildColumnMap(schema);
       const statusData = analyzeRowStatuses(rows, columnMap);
@@ -1293,7 +1320,9 @@ INTERPRETATION: a column with success=0 and error>0 is broken UNLESS its top err
         return {
           fieldId:   col.fieldId,
           name:      col.name,
+          filled:    col.filled,
           success:   col.success,
+          noData:    col.noData,
           error:     col.error,
           hasNotRun: col.hasNotRun,
           queued:    col.queued,

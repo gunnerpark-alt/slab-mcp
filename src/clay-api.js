@@ -86,6 +86,29 @@ export async function getTableSchema(tableId, viewId) {
   );
   const bestViewId = allRowsView?.id || viewId || defaultViewId;
 
+  // Enrich fields with schema-v2 data: dataType, children (output sub-fields),
+  // extractedFrom (which upstream field this derives from). Silently skipped if
+  // the endpoint is unavailable or returns an unexpected shape.
+  if (bestViewId) {
+    try {
+      const v2 = await clayRequest(`/tables/${tableId}/views/${bestViewId}/table-schema-v2`);
+      // Response may be { fields: [...] } (array) or { fields: { [id]: {...} } } (map)
+      const v2Fields = v2?.fields;
+      if (v2Fields) {
+        const v2Map = Array.isArray(v2Fields)
+          ? Object.fromEntries(v2Fields.map(f => [f.id, f]))
+          : v2Fields;
+        for (const field of orderedFields) {
+          const v2f = v2Map[field.id];
+          if (!v2f) continue;
+          if (v2f.dataType    != null) field.dataType    = v2f.dataType;
+          if (v2f.children    != null) field.children    = v2f.children;
+          if (v2f.extractedFrom != null) field.extractedFrom = v2f.extractedFrom;
+        }
+      }
+    } catch {}
+  }
+
   return {
     capturedAt:  new Date().toISOString(),
     tableId,
@@ -116,8 +139,41 @@ export async function getDefaultViewId(tableId) {
  * silently ignores every pagination parameter we tried (offset, cursor,
  * after, page, etc.) and returns at most this many rows per call. Tables
  * larger than the cap cannot be exhaustively read through this client.
+ * Use getRecordIds + bulkFetchRecords to work around this limit.
  */
 export const RECORDS_API_CAP = 20000;
+
+/**
+ * Fetch all record IDs for a view without fetching cell data.
+ * The IDs endpoint may not share the same 20k cap as the records endpoint.
+ * Returns a flat array of record ID strings.
+ */
+export async function getRecordIds(tableId, viewId) {
+  if (!viewId) viewId = await getDefaultViewId(tableId);
+  if (!viewId) throw new Error('No view ID — pass one in the URL or ensure the table has a default view');
+  const data = await clayRequest(`/tables/${tableId}/views/${viewId}/records/ids`);
+  return data.recordIds || data.ids || (Array.isArray(data) ? data : []);
+}
+
+/**
+ * Bulk-fetch records by ID list. Batches in chunks of 200.
+ * includeExternalContentFieldIds controls which columns get full nested JSON
+ * in externalContent — pass [] to skip nested JSON entirely (display values
+ * and cell statuses still come back, just without the expensive fullValue blob).
+ */
+export async function bulkFetchRecords(tableId, recordIds, includeExternalContentFieldIds = []) {
+  const BATCH_SIZE = 200;
+  const allResults = [];
+  for (let i = 0; i < recordIds.length; i += BATCH_SIZE) {
+    const batch = recordIds.slice(i, i + BATCH_SIZE);
+    const data = await clayPost(`/tables/${tableId}/bulk-fetch-records`, {
+      recordIds: batch,
+      includeExternalContentFieldIds
+    });
+    allResults.push(...(data.results || []));
+  }
+  return allResults;
+}
 
 /**
  * Fetch rows for a view in one shot — display values, statuses, rowIds.

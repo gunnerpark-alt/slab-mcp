@@ -10,10 +10,27 @@
  * not here.
  */
 
+function isFilled(value) {
+  if (value === null || value === undefined) return false;
+  if (value === '') return false;
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === 'object') return Object.keys(value).length > 0;
+  return true;
+}
+
 /**
  * Status counts per column from raw API rows.
  * Returns counts only — no judgment flags. The LLM decides what
  * "likely broken" or "run-condition gated" means based on context.
+ *
+ * Buckets:
+ *   filled    — ran successfully AND returned a meaningful value (isFilled)
+ *   success   — ran with status=SUCCESS (superset of filled; includes empty-value cells)
+ *   noData    — SUCCESS_NO_DATA: provider ran but found nothing (not an error, not a value)
+ *   error     — status=ERROR
+ *   hasNotRun — status=HAS_NOT_RUN or no metadata and value is empty
+ *   queued    — status=QUEUED
+ *   fillPct   — filled / total (not success / total)
  */
 export function analyzeRowStatuses(rows, columnMap) {
   const columns = {};
@@ -24,7 +41,9 @@ export function analyzeRowStatuses(rows, columnMap) {
         columns[fieldId] = {
           fieldId,
           name:      columnMap[fieldId] || fieldId,
+          filled:    0,
           success:   0,
+          noData:    0,
           error:     0,
           hasNotRun: 0,
           queued:    0,
@@ -32,23 +51,30 @@ export function analyzeRowStatuses(rows, columnMap) {
         };
       }
 
-      const col    = columns[fieldId];
-      const status = cell.metadata?.status || (cell.value != null ? 'SUCCESS' : 'HAS_NOT_RUN');
+      const col       = columns[fieldId];
+      const apiStatus = cell.metadata?.status;
+      const status    = apiStatus || (isFilled(cell.value) ? 'SUCCESS' : 'HAS_NOT_RUN');
 
-      if      (status === 'SUCCESS')     col.success++;
-      else if (status === 'ERROR') {
+      if (status === 'SUCCESS') {
+        col.success++;
+        if (isFilled(cell.value)) col.filled++;
+      } else if (status === 'SUCCESS_NO_DATA') {
+        col.noData++;
+      } else if (status === 'ERROR') {
         col.error++;
         const msg = cell.metadata?.error?.message || cell.error?.message || 'unknown error';
         col.errors[msg] = (col.errors[msg] || 0) + 1;
+      } else if (status === 'HAS_NOT_RUN') {
+        col.hasNotRun++;
+      } else if (status === 'QUEUED') {
+        col.queued++;
       }
-      else if (status === 'HAS_NOT_RUN') col.hasNotRun++;
-      else if (status === 'QUEUED')      col.queued++;
     }
   }
 
   for (const col of Object.values(columns)) {
-    col.total   = col.success + col.error + col.hasNotRun + col.queued;
-    col.fillPct = col.total > 0 ? Math.round((col.success / col.total) * 100) : 0;
+    col.total   = col.success + col.noData + col.error + col.hasNotRun + col.queued;
+    col.fillPct = col.total > 0 ? Math.round((col.filled / col.total) * 100) : 0;
   }
 
   return columns;
