@@ -23,6 +23,7 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 
 import { getTableSchema, listRows, getRecord, getWorkbookTables, getAllRecords, searchRecords, exportTableToCsv, fetchCsv, RECORDS_API_CAP } from './src/clay-api.js';
@@ -1654,5 +1655,51 @@ INTERPRETATION: a column with success=0 and error>0 is broken UNLESS its top err
 // Start
 // ---------------------------------------------------------------------------
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
+const transportMode = (process.env.MCP_TRANSPORT || 'stdio').toLowerCase();
+
+if (transportMode === 'http') {
+  // Remote HTTP mode for hosted deployments (Render, Fly, etc.).
+  // Stateless: each POST is a self-contained JSON-RPC exchange — no per-session
+  // state on the transport. Schema cache still lives in this Node process,
+  // shared across requests; that's fine for a single-tenant deployment.
+  const { default: express } = await import('express');
+
+  const bearer = process.env.MCP_BEARER_TOKEN;
+  if (!bearer || bearer.length < 16) {
+    console.error('FATAL: MCP_BEARER_TOKEN env var required (min 16 chars) when MCP_TRANSPORT=http');
+    process.exit(1);
+  }
+  if (!process.env.CLAY_API_KEY) {
+    console.error('FATAL: CLAY_API_KEY env var required when MCP_TRANSPORT=http');
+    process.exit(1);
+  }
+
+  const app = express();
+  app.use(express.json({ limit: '4mb' }));
+
+  app.get('/healthz', (_req, res) => res.status(200).json({ ok: true }));
+
+  const requireBearer = (req, res, next) => {
+    const provided = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    if (provided !== bearer) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    next();
+  };
+
+  const httpTransport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  await server.connect(httpTransport);
+
+  const handle = (req, res) => httpTransport.handleRequest(req, res, req.body);
+  app.post('/mcp', requireBearer, handle);
+  app.get('/mcp', requireBearer, handle);
+  app.delete('/mcp', requireBearer, handle);
+
+  const port = parseInt(process.env.PORT || '8080', 10);
+  app.listen(port, () => {
+    console.error(`slab-mcp listening on :${port} (http mode)`);
+  });
+} else {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+}
