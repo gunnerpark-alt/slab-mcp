@@ -522,7 +522,15 @@ function parseCsv(text) {
 // ---------------------------------------------------------------------------
 // MCP server
 // ---------------------------------------------------------------------------
+//
+// Wrapped in a factory so HTTP mode can instantiate a fresh server + transport
+// per request (the SDK's stateless streamable-HTTP pattern requires this — a
+// shared transport's `_initialized` flag and stream map get polluted across
+// requests). Module-level caches (schemaCache, subroutineFallbackCache) live
+// outside this function and are shared across all instances, so per-request
+// instantiation doesn't lose warm Clay schema state.
 
+function createServer() {
 const server = new McpServer({
   name: 'slab',
   version: '4.7.0'
@@ -1651,6 +1659,9 @@ INTERPRETATION: a column with success=0 and error>0 is broken UNLESS its top err
   }
 );
 
+return server;
+}
+
 // ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
@@ -1659,9 +1670,9 @@ const transportMode = (process.env.MCP_TRANSPORT || 'stdio').toLowerCase();
 
 if (transportMode === 'http') {
   // Remote HTTP mode for hosted deployments (Render, Fly, etc.).
-  // Stateless: each POST is a self-contained JSON-RPC exchange — no per-session
-  // state on the transport. Schema cache still lives in this Node process,
-  // shared across requests; that's fine for a single-tenant deployment.
+  // Per-request server + transport per the SDK's stateless streamable-HTTP
+  // pattern (see node_modules/.../examples/server/simpleStatelessStreamableHttp.js).
+  // Module-level caches survive across requests since they live outside createServer().
   const { default: express } = await import('express');
 
   const bearer = process.env.MCP_BEARER_TOKEN;
@@ -1687,19 +1698,53 @@ if (transportMode === 'http') {
     next();
   };
 
-  const httpTransport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-  await server.connect(httpTransport);
+  const handleMcp = async (req, res) => {
+    const requestServer = createServer();
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    try {
+      await requestServer.connect(transport);
+      await transport.handleRequest(req, res, req.body);
+      res.on('close', () => {
+        transport.close();
+        requestServer.close();
+      });
+    } catch (err) {
+      console.error('MCP request error:', err);
+      if (!res.headersSent) {
+        res.status(500).json({
+          jsonrpc: '2.0',
+          error: { code: -32603, message: 'Internal server error' },
+          id: null
+        });
+      }
+      transport.close();
+      requestServer.close();
+    }
+  };
 
-  const handle = (req, res) => httpTransport.handleRequest(req, res, req.body);
-  app.post('/mcp', requireBearer, handle);
-  app.get('/mcp', requireBearer, handle);
-  app.delete('/mcp', requireBearer, handle);
+  app.post('/mcp', requireBearer, handleMcp);
+  // GET and DELETE are not used in stateless mode; reject with 405.
+  app.get('/mcp', requireBearer, (_req, res) => {
+    res.status(405).json({
+      jsonrpc: '2.0',
+      error: { code: -32000, message: 'Method not allowed.' },
+      id: null
+    });
+  });
+  app.delete('/mcp', requireBearer, (_req, res) => {
+    res.status(405).json({
+      jsonrpc: '2.0',
+      error: { code: -32000, message: 'Method not allowed.' },
+      id: null
+    });
+  });
 
   const port = parseInt(process.env.PORT || '8080', 10);
   app.listen(port, () => {
     console.error(`slab-mcp listening on :${port} (http mode)`);
   });
 } else {
+  const server = createServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
