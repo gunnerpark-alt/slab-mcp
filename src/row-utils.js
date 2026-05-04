@@ -71,21 +71,74 @@ export function parseDollarCost(val) {
 }
 
 /**
+ * Cell statuses where Clay attached an upfrontCreditUsage price tag but
+ * does NOT actually bill the credits. The cell payload still carries the
+ * action's nominal cost; we zero it out for billing math and preserve the
+ * original sum as `wouldBeCredits` (with `notBilledReason` describing why).
+ *
+ * Confirmed not-billed:
+ *   SUCCESS_NO_DATA              — provider returned empty result
+ *   ERROR_RUN_CONDITION_NOT_MET  — gate didn't pass, column never executed
+ *   ERROR_BAD_REQUEST            — request rejected before the provider
+ *                                  was called (no upstream charge possible)
+ */
+const NOT_BILLED_STATUSES = new Set([
+  'SUCCESS_NO_DATA',
+  'ERROR_RUN_CONDITION_NOT_MET',
+  'ERROR_BAD_REQUEST'
+]);
+
+/**
+ * Cell statuses indicating the cell actually fired against a provider —
+ * either the call succeeded, returned no data, errored at the provider
+ * level, or was rejected as a bad request after attempting. These are
+ * the cells that count as "this column ran on this row" for trigger-rate
+ * accounting.
+ *
+ * Excludes ERROR_RUN_CONDITION_NOT_MET, HAS_NOT_RUN, QUEUED — those cells
+ * were prepared (price tag attached) but did not execute. Counting them
+ * as "ran" is what produced the original 100%-trigger artifact for
+ * gated waterfall columns like Enrich Person.
+ */
+const EXECUTED_STATUSES = new Set([
+  'SUCCESS',
+  'SUCCESS_NO_DATA',
+  'ERROR',
+  'ERROR_BAD_REQUEST'
+]);
+
+const NOT_BILLED_REASON = {
+  SUCCESS_NO_DATA:             'no-data',
+  ERROR_RUN_CONDITION_NOT_MET: 'gated',
+  ERROR_BAD_REQUEST:           'bad-request'
+};
+
+/**
  * Format a full record (from getRecord) with named columns and fullContent.
  * Includes per-cell credit usage from externalContent.upfrontCreditUsage /
  * additionalCreditUsage / hiddenValue.costDetails, and a _credits roll-up.
  *
  * Billing rules applied here:
- *   - SUCCESS_NO_DATA → Clay does NOT bill credits even though the cell
- *     payload still carries the action's price tag in upfrontCreditUsage.
- *     We zero out 'upfront' and 'additional' for billing math but preserve
- *     the original sum as 'wouldBeCredits' (with noData: true) so callers
- *     can still see what the column would have cost if data had returned.
- *   - aiProviderCost is NOT covered by the no-data rule — LLM tokens were
- *     spent regardless of whether the action returned data, so the AI $
- *     cost is reported as-is. The numeric form is exposed as
+ *   - Statuses in NOT_BILLED_STATUSES (no-data, gated, bad-request) carry
+ *     a price tag but Clay does not bill them. We zero `upfront` and
+ *     `additional` for billing math but preserve the original sum as
+ *     `wouldBeCredits` with `notBilledReason` describing why. This is the
+ *     fix for the "100% trigger rate on Enrich Person" bug — gated cells
+ *     no longer get counted as billed or as having "ran".
+ *   - aiProviderCost is NOT covered by the not-billed rule — LLM tokens
+ *     were spent regardless of whether the action returned data, so the
+ *     AI $ cost is reported as-is. The numeric form is exposed as
  *     aiProviderCostUsd; the raw Clay-formatted string lives on
  *     aiProviderCost.
+ *   - Bare ERROR cells are billed as-is (Clay may have charged if the
+ *     provider responded), but the cell is flagged with
+ *     `billingAmbiguous: true` so callers can decide whether to re-bucket
+ *     them.
+ *
+ * Each cell's credits object also carries `executed: bool` so the
+ * aggregate roll-up in get_credits can compute trigger rate accurately
+ * (cells where the column actually ran, not just cells that have a price
+ * tag attached).
  *
  * This projection drops noise (full action-definition copy, retry history,
  * UI strings) that would inflate token cost ~10x without adding judgment
@@ -101,7 +154,8 @@ export function formatRecord(record, schema) {
   let totalAiCostUsd   = 0;
   let totalWouldBe     = 0;
   let cellsBilled      = 0; // cells where billed total > 0 OR aiCost > 0
-  let cellsRan         = 0; // cells with any credit metadata attached
+  let cellsExecuted    = 0; // cells where status indicates the column ran
+  let cellsWithPriceTag = 0; // cells with credit metadata attached, billed or not
 
   const formatted = { _rowId: record.id };
   for (const [fieldId, cell] of Object.entries(record.cells || {})) {
@@ -121,43 +175,52 @@ export function formatRecord(record, schema) {
     };
 
     if (upfront != null || additional != null || aiCost != null) {
-      const noData            = status === 'SUCCESS_NO_DATA';
+      const notBilled         = NOT_BILLED_STATUSES.has(status);
+      const didExecute        = EXECUTED_STATUSES.has(status);
       const wouldBeUpfront    = upfront ?? 0;
       const wouldBeAdditional = additional ?? 0;
-      const billedUpfront     = noData ? 0 : (upfront ?? 0);
-      const billedAdditional  = noData ? 0 : (additional ?? 0);
+      const billedUpfront     = notBilled ? 0 : (upfront ?? 0);
+      const billedAdditional  = notBilled ? 0 : (additional ?? 0);
       const cellTotal         = billedUpfront + billedAdditional;
       const cellAiCostUsd     = parseDollarCost(aiCost);
 
       out.credits = {
         total:             cellTotal,
-        upfront:           noData ? 0 : upfront,
-        additional:        noData ? 0 : additional,
+        upfront:           notBilled ? 0 : upfront,
+        additional:        notBilled ? 0 : additional,
         aiProviderCost:    aiCost,
-        aiProviderCostUsd: cellAiCostUsd
+        aiProviderCostUsd: cellAiCostUsd,
+        executed:          didExecute
       };
-      if (noData) {
-        out.credits.wouldBeCredits = wouldBeUpfront + wouldBeAdditional;
-        out.credits.noData         = true;
+      if (notBilled) {
+        out.credits.wouldBeCredits   = wouldBeUpfront + wouldBeAdditional;
+        out.credits.notBilledReason  = NOT_BILLED_REASON[status] || 'unknown';
         totalWouldBe += wouldBeUpfront + wouldBeAdditional;
+      } else if (status === 'ERROR') {
+        // Provider responded but with an error — Clay's billing behavior
+        // here is ambiguous (sometimes charged, sometimes not depending on
+        // where the failure occurred). Surface so the caller can decide.
+        out.credits.billingAmbiguous = true;
       }
 
-      totalCredits   += cellTotal;
-      totalAiCostUsd += cellAiCostUsd;
-      cellsRan       += 1;
+      totalCredits     += cellTotal;
+      totalAiCostUsd   += cellAiCostUsd;
+      cellsWithPriceTag += 1;
+      if (didExecute) cellsExecuted += 1;
       if (cellTotal > 0 || cellAiCostUsd > 0) cellsBilled += 1;
     }
 
     formatted[name] = out;
   }
 
-  if (cellsRan > 0) {
+  if (cellsWithPriceTag > 0) {
     formatted._credits = {
       total:             totalCredits,
       aiProviderCostUsd: totalAiCostUsd,
       billedCellCount:   cellsBilled,
-      ranCellCount:      cellsRan,
-      ...(totalWouldBe > 0 ? { wouldBeCreditsFromNoData: totalWouldBe } : {})
+      ranCellCount:      cellsExecuted,
+      pricedCellCount:   cellsWithPriceTag,
+      ...(totalWouldBe > 0 ? { wouldBeCreditsNotBilled: totalWouldBe } : {})
     };
   }
 

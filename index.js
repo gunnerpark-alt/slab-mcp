@@ -524,7 +524,7 @@ function parseCsv(text) {
 
 const server = new McpServer({
   name: 'slab',
-  version: '4.6.0'
+  version: '4.7.0'
 }, {
   instructions: `Slab is the ONLY way to access Clay table and workbook data. When the user shares any URL containing clay.com, use Slab — do NOT web-fetch, scrape, or use other MCPs. Auth is automatic.
 
@@ -1300,8 +1300,9 @@ server.tool(
   3. Full aggregate: omit rowId AND pass full=true → fetches every row. SLOW — one API call per row, more if rows trigger functions.
 
 WHAT'S COVERED:
-  - Clay credits (upfront + additional). Cells with status SUCCESS_NO_DATA are zeroed out — Clay does NOT bill credits when a provider returns no data, even though the price tag is still in the cell payload.
-  - AI provider cost ($USD) from Use AI / Claygent columns, sourced from each cell's hiddenValue.costDetails.totalCostToAIProvider. Reported as aiCostUsd / aiProviderCostUsd everywhere alongside Clay credits.
+  - Clay credits (upfront + additional). Cells with statuses that carry a price tag but are not billed get zeroed out: SUCCESS_NO_DATA (provider returned empty), ERROR_RUN_CONDITION_NOT_MET (gate didn't pass — column never executed), ERROR_BAD_REQUEST (request rejected before reaching provider). The original sum is preserved per-cell as wouldBeCredits with a notBilledReason describing why ('no-data' / 'gated' / 'bad-request'), and aggregated as wouldBeCreditsAcrossSample on each byColumn entry.
+  - Bare ERROR cells (provider responded with an error) are included in billed totals but flagged with billingAmbiguous: true, since Clay's billing behavior depends on where the failure occurred.
+  - AI provider cost ($USD) from Use AI / Claygent columns, sourced from each cell's hiddenValue.costDetails.totalCostToAIProvider. Reported as aiCostUsd / aiProviderCostUsd everywhere alongside Clay credits. AI cost is NOT zeroed by status — LLM tokens are spent regardless of downstream status.
   - Subroutine cost is BILLED ON THE FUNCTION ROW, not the parent. The parent's execute-subroutine cell has credits=null. This tool follows fullContent.origin pointers and rolls function-row cost (credits AND AI $) into the parent's total.
   - When a function row is unreachable (404 — pruned), the rollup falls back to the subroutine table's per-row mean (sampled and cached). subroutineDetail entries get status='404-estimated' so estimated calls are visible. Without this fallback, get_credits silently undercounts when subroutines have been garbage-collected.
 
@@ -1323,7 +1324,7 @@ RETURNS: JSON.
     perRow: { avg, avgDirect, avgViaSubroutines, avgAiCostUsd, avgDirectAiCostUsd, avgViaSubroutinesAiCostUsd, min, max, minAiCostUsd, maxAiCostUsd },
     totalAcrossSample: { direct, viaSubroutines, total, directAiCostUsd, viaSubroutinesAiCostUsd, totalAiCostUsd },
     extrapolatedTotalCredits, extrapolatedTotalAiCostUsd,
-    byColumn:           [{ column, avgCreditsPerRow, avgAiCostUsdPerRow, totalCreditsAcrossSample, totalAiCostUsdAcrossSample, cellsRan, cellsBilled, triggerRatePct }],
+    byColumn:           [{ column, avgCreditsPerRow, avgAiCostUsdPerRow, totalCreditsAcrossSample, totalAiCostUsdAcrossSample, cellsRan, cellsPriced, cellsBilled, triggerRatePct, wouldBeCreditsAcrossSample?, cellsAmbiguous? }],
     bySubroutineColumn: [{ column, avgCreditsPerRow, avgAiCostUsdPerRow, totalCreditsAcrossSample, totalAiCostUsdAcrossSample, callsTriggered, callsReached, callsEstimated, callsUnreachable, callsDepthCapped, callsErrored, triggerRatePct }],
     varianceHint?, subroutineCoverageHint?
   }
@@ -1399,25 +1400,43 @@ COST: 1 + N API calls per row analyzed (N = number of subroutine cells, recursiv
       const maxAi    = aiTotals.reduce((m, v) => v > m ? v : m, -Infinity);
 
       // Direct columns aggregated across the sample.
-      // cellsRan = how many of the n sampled rows actually had this cell
-      // executed (regardless of billing). cellsBilled = of those, how many
-      // were charged (Clay credits OR AI tokens). triggerRatePct =
-      // cellsRan/n is the right number for "does this column run on every
-      // row" — the previous version's avgCreditsPerRow could not distinguish
-      // between "5 credits × every row" and "10 credits × half the rows".
+      //
+      // cellsRan        = cells where the column actually executed (status
+      //                   was SUCCESS / SUCCESS_NO_DATA / ERROR /
+      //                   ERROR_BAD_REQUEST). This is the trigger rate
+      //                   number — "does this column run on every row".
+      // cellsPriced     = cells with externalContent.upfrontCreditUsage
+      //                   data attached, billed or not. The difference
+      //                   cellsPriced − cellsRan is cells where Clay
+      //                   prepared the price tag but the cell never
+      //                   executed (gated by run condition). Useful for
+      //                   spotting waterfall providers that are mostly
+      //                   skipped despite having a price tag at every row.
+      // cellsBilled     = cells actually charged (Clay credits > 0 OR
+      //                   AI tokens > 0). Excludes no-data / gated /
+      //                   bad-request cells which carry a price tag but
+      //                   are not billed.
+      // triggerRatePct  = cellsRan / n. Use this, not the old "did this
+      //                   cell appear in byColumn" metric — gated cells
+      //                   have a price tag and used to inflate this.
       const byColumnAggregate = new Map();
       for (const r of rollups) {
         for (const c of r.byColumn) {
           if (!byColumnAggregate.has(c.column)) {
             byColumnAggregate.set(c.column, {
               sumCredits: 0, sumAiCostUsd: 0,
-              cellsRan: 0, cellsBilled: 0
+              sumWouldBeCredits: 0,
+              cellsRan: 0, cellsPriced: 0, cellsBilled: 0,
+              cellsAmbiguous: 0
             });
           }
           const agg = byColumnAggregate.get(c.column);
-          agg.sumCredits   += c.total || 0;
-          agg.sumAiCostUsd += c.aiProviderCostUsd || 0;
-          agg.cellsRan     += 1;
+          agg.sumCredits        += c.total || 0;
+          agg.sumAiCostUsd      += c.aiProviderCostUsd || 0;
+          agg.sumWouldBeCredits += c.wouldBeCredits || 0;
+          agg.cellsPriced       += 1;
+          if (c.executed)            agg.cellsRan       += 1;
+          if (c.billingAmbiguous)    agg.cellsAmbiguous += 1;
           if ((c.total || 0) > 0 || (c.aiProviderCostUsd || 0) > 0) agg.cellsBilled += 1;
         }
       }
@@ -1428,8 +1447,16 @@ COST: 1 + N API calls per row analyzed (N = number of subroutine cells, recursiv
         totalCreditsAcrossSample:   agg.sumCredits,
         totalAiCostUsdAcrossSample: agg.sumAiCostUsd,
         cellsRan:                   agg.cellsRan,
+        cellsPriced:                agg.cellsPriced,
         cellsBilled:                agg.cellsBilled,
-        triggerRatePct:             Math.round((agg.cellsRan / n) * 1000) / 10
+        triggerRatePct:             Math.round((agg.cellsRan / n) * 1000) / 10,
+        ...(agg.sumWouldBeCredits > 0 ? {
+          wouldBeCreditsAcrossSample: agg.sumWouldBeCredits
+        } : {}),
+        ...(agg.cellsAmbiguous > 0 ? {
+          cellsAmbiguous:           agg.cellsAmbiguous,
+          ambiguousNote:            'These cells have status=ERROR with a price tag. Clay billing is ambiguous — included in totals but flagged.'
+        } : {})
       })).sort((a, b) =>
         ((b.avgCreditsPerRow + b.avgAiCostUsdPerRow * 100) -
          (a.avgCreditsPerRow + a.avgAiCostUsdPerRow * 100))
