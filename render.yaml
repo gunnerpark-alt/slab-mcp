@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: slab-mcp
+    runtime: node
+    plan: starter
+    region: oregon
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /healthz
+    envVars:
+      - key: MCP_TRANSPORT
+        value: http
+      - key: NODE_VERSION
+        value: "20"
+      - key: CLAY_API_KEY
+        sync: false
+      - key: MCP_BEARER_TOKEN
+        sync: false
