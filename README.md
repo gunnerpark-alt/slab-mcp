@@ -4,7 +4,7 @@
 
 Connects Claude (Desktop, Code, or any MCP client) to Clay. Share any `app.clay.com` URL and Claude can read the schema, pull rows, trace enrichment failures end-to-end through Clay Functions (subroutines), and see exactly how many credits each cell consumed. Two installable Claude Code skills (`write-clay-formula`, `write-claygent-prompt`) cover the writing workflows.
 
-> This is the **API-key branch**. It authenticates with a Clay API key instead of a session cookie — cross-platform (macOS / Linux / Windows), no Chrome dependency. The cookie-based version lives on the `main` branch.
+> slab authenticates with a Clay API key — cross-platform (macOS / Linux / Windows), no Chrome dependency.
 
 ---
 
@@ -28,7 +28,7 @@ A core design choice: **slab returns structured JSON, not pre-digested prose**. 
 
 ## Requirements
 
-- **Node ≥ 18.** Uses native `fetch` + ESM. Runs on macOS, Linux, and Windows.
+- **Node ≥ 18.** Uses native `fetch` + ESM. Runs on macOS, Linux, and Windows. Open a terminal and run `node -v` to check — if it prints a version below 18 or the command isn't found, install from [nodejs.org](https://nodejs.org/).
 - **A Clay API key.** Get one from your workspace settings (see [Authentication](#authentication)).
 
 ---
@@ -36,12 +36,13 @@ A core design choice: **slab returns structured JSON, not pre-digested prose**. 
 ## Installation
 
 ```bash
-git clone -b api-key-auth https://github.com/gunnerpark-alt/slab-mcp.git
+git clone https://github.com/gunnerpark-alt/slab-mcp.git
 cd slab-mcp
 npm install
+pwd     # note this path — you'll paste it into your MCP client config below
 ```
 
-That's it for the server. Next step is auth + wiring into your MCP client.
+That's it for the server. Next step is auth + wiring into your MCP client. Hold onto the `pwd` output — the MCP config wants the absolute path to `index.js` inside this directory (e.g., `/Users/yourname/slab-mcp/index.js`).
 
 ---
 
@@ -93,7 +94,7 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) o
   "mcpServers": {
     "slab": {
       "command": "node",
-      "args": ["/absolute/path/to/slab-mcp/index.js"],
+      "args": ["/Users/yourname/slab-mcp/index.js"],
       "env": {
         "CLAY_API_KEY": "<paste-your-key-here>"
       }
@@ -101,6 +102,8 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) o
   }
 }
 ```
+
+Replace `/Users/yourname/slab-mcp/index.js` with the actual absolute path on your machine — the `pwd` output from the install step plus `/index.js` (for example, `/Users/enisrama/slab-mcp/index.js`). On Windows, use a path like `C:\\Users\\yourname\\slab-mcp\\index.js`.
 
 Quit and relaunch Claude Desktop. Verify in **Settings → Developer** that `slab` shows as connected.
 
@@ -113,7 +116,7 @@ Add to `~/.claude.json` (user-level) or a project `.mcp.json`:
   "mcpServers": {
     "slab": {
       "command": "node",
-      "args": ["/absolute/path/to/slab-mcp/index.js"],
+      "args": ["/Users/yourname/slab-mcp/index.js"],
       "env": {
         "CLAY_API_KEY": "<paste-your-key-here>"
       }
@@ -139,7 +142,7 @@ Then in Claude Code run `/mcp` and reconnect `slab`.
 slab is a standard stdio MCP server. Anything that speaks MCP can run it. Make sure `CLAY_API_KEY` is in the environment (or that `~/.slab/config.json` exists):
 
 ```bash
-CLAY_API_KEY=<your-key> node /absolute/path/to/slab-mcp/index.js
+CLAY_API_KEY=<your-key> node /Users/yourname/slab-mcp/index.js
 ```
 
 ---
