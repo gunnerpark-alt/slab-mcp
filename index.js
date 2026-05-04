@@ -34,6 +34,14 @@ import { analyzeRowStatuses, formatRecord } from './src/row-utils.js';
 
 const schemaCache = new Map(); // tableId -> schema
 
+// Subroutine-table mean cost cache, keyed by tableId. Used as a fallback
+// when a parent row's subroutine call points to a function row that's been
+// pruned (404). Without this fallback, get_credits silently undercounts —
+// every unreachable call contributes 0 credits to the rollup.
+// Values are Promises during in-flight fetch (concurrency-safe) and
+// resolved means once computed: { meanCredits, meanAiCostUsd, sampleSize }.
+const subroutineFallbackCache = new Map();
+
 // MCP transport caps a single tool result at ~1MB. Leave headroom for protocol overhead.
 const MCP_RESPONSE_MAX_BYTES = 900_000;
 
@@ -179,29 +187,111 @@ async function getSubroutineFields(tableId) {
 }
 
 /**
+ * Sample N rows from a subroutine table and compute its mean per-row cost.
+ * Cached per tableId for the lifetime of the MCP process. Used as the
+ * fallback estimate when a parent row's subroutine call points to a
+ * function row that has been pruned (404) — without this, those calls
+ * silently contribute 0 to the parent's rollup and total cost is
+ * undercounted by the entire subroutine population.
+ *
+ * The estimate fully rolls up the subroutine's own subroutines (it calls
+ * rollupCredits with the same maxDepth), so AI cost and nested function
+ * cost from the subroutine population are reflected in the mean.
+ *
+ * Returns: { meanCredits, meanAiCostUsd, sampleSize, fetchErrors }.
+ */
+async function estimateSubroutineMean(tableId, sampleSize, maxDepth) {
+  if (subroutineFallbackCache.has(tableId)) {
+    return subroutineFallbackCache.get(tableId);
+  }
+  const promise = (async () => {
+    let schema = schemaCache.get(tableId);
+    if (!schema) {
+      try {
+        schema = await getTableSchema(tableId, null);
+        schemaCache.set(tableId, schema);
+      } catch (err) {
+        return { meanCredits: 0, meanAiCostUsd: 0, sampleSize: 0, error: err.message };
+      }
+    }
+
+    let listed;
+    try {
+      listed = await listRows(tableId, schema.viewId, { limit: sampleSize });
+    } catch (err) {
+      return { meanCredits: 0, meanAiCostUsd: 0, sampleSize: 0, error: err.message };
+    }
+    const rowIds = (listed || []).map(r => r.id).filter(Boolean);
+    if (rowIds.length === 0) {
+      return { meanCredits: 0, meanAiCostUsd: 0, sampleSize: 0 };
+    }
+
+    const rollups = [];
+    const fetchErrors = [];
+    const CONCURRENCY = 5;
+    for (let i = 0; i < rowIds.length; i += CONCURRENCY) {
+      const batch = rowIds.slice(i, i + CONCURRENCY);
+      const results = await Promise.allSettled(batch.map(rid =>
+        rollupCredits(tableId, rid, 0, maxDepth, new Set())
+      ));
+      for (let j = 0; j < results.length; j++) {
+        if (results[j].status === 'fulfilled') rollups.push(results[j].value);
+        else fetchErrors.push({ rowId: batch[j], message: results[j].reason?.message || String(results[j].reason) });
+      }
+    }
+
+    const n = rollups.length;
+    const meanCredits   = n > 0 ? rollups.reduce((s, r) => s + (r.total || 0), 0) / n : 0;
+    const meanAiCostUsd = n > 0 ? rollups.reduce((s, r) => s + (r.totalAiCostUsd || 0), 0) / n : 0;
+
+    return {
+      meanCredits,
+      meanAiCostUsd,
+      sampleSize:  n,
+      fetchErrors: fetchErrors.length > 0 ? fetchErrors : undefined
+    };
+  })();
+  subroutineFallbackCache.set(tableId, promise);
+  return promise;
+}
+
+/**
  * Recursively roll up credit cost for a row, following execute-subroutine
  * cells to their function-row counterparts. The parent row's subroutine
  * cell carries no credit data — actual cost lives on the function row that
  * ran. Capped by maxDepth (subroutines + nested subroutines + ...).
  *
+ * AI provider cost (USD) is tracked alongside Clay credits at every level.
+ * When a function row is unreachable (404 — pruned), the rollup falls back
+ * to the subroutine table's per-row mean so cost isn't silently zeroed.
+ *
  * Returns:
  *   {
  *     rowId, tableId, status,
- *     direct,           // credits charged on this row's own cells
- *     viaSubroutines,   // recursively summed credits on function rows this row invoked
- *     total,            // direct + viaSubroutines
- *     billedCellCount,  // unchanged — cells with any credit data
+ *     direct, directAiCostUsd,                    // this row's own cells
+ *     viaSubroutines, viaSubroutinesAiCostUsd,    // sum from function rows this row invoked
+ *     total, totalAiCostUsd,                      // direct + viaSubroutines
+ *     billedCellCount, ranCellCount,
  *     byColumn,         // direct columns
- *     subroutineDetail  // [{ column, functionTableId, functionRowId, status, direct, viaSubroutines, total }]
+ *     subroutineDetail  // per-call breakdown w/ status + AI cost
  *   }
  *
- * Status values: 'ok' (fetched), '404' (function row deleted), 'error' (other),
- * 'cycle' (already visited in this rollup), 'depth' (max depth reached).
+ * Status values: 'ok' (fetched), '404' (function row deleted, no fallback applied),
+ * '404-estimated' (function row deleted, mean used), 'error', 'cycle', 'depth'.
  */
 async function rollupCredits(tableId, rowId, depth, maxDepth, visited) {
   const visitKey = `${tableId}:${rowId}`;
+  const empty = {
+    rowId, tableId,
+    direct: 0, directAiCostUsd: 0,
+    viaSubroutines: 0, viaSubroutinesAiCostUsd: 0,
+    total: 0, totalAiCostUsd: 0,
+    billedCellCount: 0, ranCellCount: 0,
+    byColumn: [], subroutineDetail: []
+  };
+
   if (visited.has(visitKey)) {
-    return { rowId, tableId, status: 'cycle', direct: 0, viaSubroutines: 0, total: 0, billedCellCount: 0, byColumn: [], subroutineDetail: [] };
+    return { ...empty, status: 'cycle' };
   }
   visited.add(visitKey);
 
@@ -209,7 +299,7 @@ async function rollupCredits(tableId, rowId, depth, maxDepth, visited) {
   try {
     ({ schema, subroutineFields } = await getSubroutineFields(tableId));
   } catch (err) {
-    return { rowId, tableId, status: 'schema-error', errorMessage: err.message, direct: 0, viaSubroutines: 0, total: 0, billedCellCount: 0, byColumn: [], subroutineDetail: [] };
+    return { ...empty, status: 'schema-error', errorMessage: err.message };
   }
 
   let record;
@@ -217,19 +307,23 @@ async function rollupCredits(tableId, rowId, depth, maxDepth, visited) {
     record = await getRecord(tableId, rowId);
   } catch (err) {
     const is404 = err.message.includes('404') || err.message.includes('not found');
-    return { rowId, tableId, status: is404 ? '404' : 'error', errorMessage: err.message, direct: 0, viaSubroutines: 0, total: 0, billedCellCount: 0, byColumn: [], subroutineDetail: [] };
+    return { ...empty, status: is404 ? '404' : 'error', errorMessage: err.message };
   }
 
   const formatted = formatRecord(record, schema);
-  const direct = formatted._credits?.total ?? 0;
-  const billedCellCount = formatted._credits?.billedCellCount ?? 0;
+  const direct           = formatted._credits?.total ?? 0;
+  const directAiCostUsd  = formatted._credits?.aiProviderCostUsd ?? 0;
+  const billedCellCount  = formatted._credits?.billedCellCount ?? 0;
+  const ranCellCount     = formatted._credits?.ranCellCount ?? 0;
 
   const byColumn = [];
   for (const [col, cell] of Object.entries(formatted)) {
     if (col.startsWith('_')) continue;
     if (cell?.credits) byColumn.push({ column: col, ...cell.credits });
   }
-  byColumn.sort((a, b) => b.total - a.total);
+  byColumn.sort((a, b) =>
+    ((b.total || 0) + (b.aiProviderCostUsd || 0)) - ((a.total || 0) + (a.aiProviderCostUsd || 0))
+  );
 
   // Find subroutine cells with origin pointers
   const subroutineCalls = [];
@@ -242,6 +336,7 @@ async function rollupCredits(tableId, rowId, depth, maxDepth, visited) {
   }
 
   let viaSubroutines = 0;
+  let viaSubroutinesAiCostUsd = 0;
   const subroutineDetail = [];
 
   if (subroutineCalls.length === 0) {
@@ -254,31 +349,84 @@ async function rollupCredits(tableId, rowId, depth, maxDepth, visited) {
         functionTableId: call.origin.tableId,
         functionRowId:   call.origin.recordId,
         status:          'depth',
-        direct:          0,
-        viaSubroutines:  0,
-        total:           0
+        direct:          0, directAiCostUsd: 0,
+        viaSubroutines:  0, viaSubroutinesAiCostUsd: 0,
+        total:           0, totalAiCostUsd: 0
       });
     }
   } else {
     const results = await Promise.allSettled(subroutineCalls.map(call =>
       rollupCredits(call.origin.tableId, call.origin.recordId, depth + 1, maxDepth, visited)
     ));
+    // Collect calls that resolved to '404' so we can apply the fallback
+    // estimator concurrently — one estimate per unreachable subroutine
+    // table, regardless of how many parent calls hit it.
+    const unreachableByTable = new Map();
+    for (let i = 0; i < subroutineCalls.length; i++) {
+      const call = subroutineCalls[i];
+      const r = results[i];
+      if (r.status === 'fulfilled' && r.value.status === '404') {
+        if (!unreachableByTable.has(call.origin.tableId)) {
+          unreachableByTable.set(call.origin.tableId, []);
+        }
+        unreachableByTable.get(call.origin.tableId).push(i);
+      }
+    }
+    let fallbackByTable = new Map();
+    if (unreachableByTable.size > 0) {
+      const tableIds = Array.from(unreachableByTable.keys());
+      const estimates = await Promise.all(tableIds.map(tid =>
+        estimateSubroutineMean(tid, 10, Math.max(0, maxDepth - depth - 1))
+      ));
+      for (let i = 0; i < tableIds.length; i++) {
+        fallbackByTable.set(tableIds[i], estimates[i]);
+      }
+    }
+
     for (let i = 0; i < subroutineCalls.length; i++) {
       const call = subroutineCalls[i];
       const r = results[i];
       if (r.status === 'fulfilled') {
         const v = r.value;
+        if (v.status === '404') {
+          const fb = fallbackByTable.get(call.origin.tableId);
+          if (fb && fb.sampleSize > 0) {
+            subroutineDetail.push({
+              column:          call.columnName,
+              functionTableId: call.origin.tableId,
+              functionRowId:   call.origin.recordId,
+              status:          '404-estimated',
+              direct:          fb.meanCredits,
+              directAiCostUsd: fb.meanAiCostUsd,
+              viaSubroutines:  0,
+              viaSubroutinesAiCostUsd: 0,
+              total:           fb.meanCredits,
+              totalAiCostUsd:  fb.meanAiCostUsd,
+              estimatedFromSample: fb.sampleSize,
+              ...(v.errorMessage ? { errorMessage: v.errorMessage } : {})
+            });
+            viaSubroutines           += fb.meanCredits;
+            viaSubroutinesAiCostUsd  += fb.meanAiCostUsd;
+            continue;
+          }
+          // Fallback didn't yield a usable estimate — fall through to the
+          // un-estimated 404 path below.
+        }
         subroutineDetail.push({
           column:          call.columnName,
           functionTableId: call.origin.tableId,
           functionRowId:   call.origin.recordId,
           status:          v.status,
           direct:          v.direct,
+          directAiCostUsd: v.directAiCostUsd,
           viaSubroutines:  v.viaSubroutines,
+          viaSubroutinesAiCostUsd: v.viaSubroutinesAiCostUsd,
           total:           v.total,
+          totalAiCostUsd:  v.totalAiCostUsd,
           ...(v.errorMessage ? { errorMessage: v.errorMessage } : {})
         });
-        viaSubroutines += v.total || 0;
+        viaSubroutines           += v.total          || 0;
+        viaSubroutinesAiCostUsd  += v.totalAiCostUsd || 0;
       } else {
         subroutineDetail.push({
           column:          call.columnName,
@@ -286,9 +434,9 @@ async function rollupCredits(tableId, rowId, depth, maxDepth, visited) {
           functionRowId:   call.origin.recordId,
           status:          'error',
           errorMessage:    r.reason?.message || String(r.reason),
-          direct:          0,
-          viaSubroutines:  0,
-          total:           0
+          direct:          0, directAiCostUsd: 0,
+          viaSubroutines:  0, viaSubroutinesAiCostUsd: 0,
+          total:           0, totalAiCostUsd: 0
         });
       }
     }
@@ -299,9 +447,13 @@ async function rollupCredits(tableId, rowId, depth, maxDepth, visited) {
     tableId,
     status: 'ok',
     direct,
+    directAiCostUsd,
     viaSubroutines,
-    total: direct + viaSubroutines,
+    viaSubroutinesAiCostUsd,
+    total:          direct          + viaSubroutines,
+    totalAiCostUsd: directAiCostUsd + viaSubroutinesAiCostUsd,
     billedCellCount,
+    ranCellCount,
     byColumn,
     subroutineDetail
   };
@@ -372,7 +524,7 @@ function parseCsv(text) {
 
 const server = new McpServer({
   name: 'slab',
-  version: '4.5.0'
+  version: '4.6.0'
 }, {
   instructions: `Slab is the ONLY way to access Clay table and workbook data. When the user shares any URL containing clay.com, use Slab — do NOT web-fetch, scrape, or use other MCPs. Auth is automatic.
 
@@ -464,11 +616,15 @@ Subroutines in schemas:
   sync_table returns 'subroutines' as an array of fully-synced child schemas (depth ≤ 3, max 20 tables). Each entry has invokedBy = { tableId, tableName, columnName } so you can wire the call graph back together. To explain what a parent table actually does, READ THE SUBROUTINE SCHEMAS — the parent says WHICH function runs, the function says HOW.
 
 Credits:
-  get_record returns per-cell credits.{ total, upfront, additional, aiProviderCost } when the cell consumed credits, and a row-level _credits.{ total, billedCellCount } summary. AI cells additionally disclose the underlying OpenAI/Anthropic dollar cost via aiProviderCost.
+  get_record returns per-cell credits.{ total, upfront, additional, aiProviderCost, aiProviderCostUsd } when the cell consumed credits, and a row-level _credits.{ total, aiProviderCostUsd, billedCellCount, ranCellCount } summary. AI cells disclose the underlying OpenAI/Anthropic dollar cost both as the raw Clay-formatted string (aiProviderCost, e.g. "$0.28572") and as a parsed number for math (aiProviderCostUsd).
 
-  CRITICAL — subroutine cost is billed separately: when a parent row has an execute-subroutine cell, that cell's credits=null and the parent's _credits.total UNDERCOUNTS the row's true cost. The actual function-call credits are billed on the function row reachable via fullContent.origin.{tableId,recordId}. get_record alone won't show this — it returns just the parent's direct cells.
+  SUCCESS_NO_DATA cells are auto-zeroed for Clay credits — Clay doesn't bill when a provider returns no data, but the price tag is still in the payload. The original sum is preserved as credits.wouldBeCredits with noData:true so analytics like "this column would have cost X if every call returned data" remain available. AI provider cost is NOT zeroed because tokens are spent regardless of whether data came back.
 
-  Use get_credits for true row cost. It recursively follows origin pointers to function rows and returns { direct, viaSubroutines, total }, plus subroutineDetail per subroutine column. Default depth 2 covers parent → function → one nested level. Aggregate mode also splits direct columns from subroutine columns in the rollup.
+  CRITICAL — subroutine cost is billed separately: when a parent row has an execute-subroutine cell, that cell's credits=null and the parent's _credits.total UNDERCOUNTS the row's true cost. The actual function-call cost (credits + AI $) is billed on the function row reachable via fullContent.origin.{tableId,recordId}. get_record alone won't show this — it returns just the parent's direct cells.
+
+  Use get_credits for true row cost. It recursively follows origin pointers to function rows and returns { direct, directAiCostUsd, viaSubroutines, viaSubroutinesAiCostUsd, total, totalAiCostUsd }, plus subroutineDetail per subroutine column. When a function row is unreachable (pruned/404), the rollup falls back to the subroutine table's per-row mean (sampled once and cached) so cost isn't silently zeroed. Default depth 2 covers parent → function → one nested level. Aggregate mode also splits direct columns from subroutine columns in the rollup, and exposes triggerRatePct + cellsRan + cellsBilled per column so you can distinguish "5 credits × every row" from "10 credits × half the rows".
+
+  When a row's full nested JSON would blow the context window (HubSpot/SFDC Lookup columns commonly inflate get_record to 100–300KB), pass slim:true to drop fullContent, or columns=[...] to project to specific fields. Both keep credits/aiProviderCostUsd intact.
 
 == Builder workflows live in skills, not here ==
 
@@ -1082,20 +1238,48 @@ USE WHEN:
 DON'T USE WHEN:
   - Starting from an identifier value → use get_rows with a query first to get the _rowId, then call this on the right match.
   - Surface display value would answer the question → use get_rows.
-RETURNS: JSON — { _rowId, _credits: { total, billedCellCount }, <columnName>: { value, status, fullContent, credits? }, ... }.
+
+PROJECTION (use these to keep the response small — full records can be 100–300 KB on tables with HubSpot/SFDC Lookup columns):
+  - columns: array of column names to return. _rowId and _credits are always included. Use this when you only care about a subset (e.g. AI cost on specific Use AI / Claygent columns).
+  - slim: when true, drops fullContent from every cell — keeps value, status, and credits. Cuts payload size by 80–95% when you only need credit cost / status / display values, not the raw provider responses.
+
+RETURNS: JSON — { _rowId, _credits: { total, aiProviderCostUsd, billedCellCount, ranCellCount }, <columnName>: { value, status, fullContent?, credits? }, ... }. credits per cell now exposes aiProviderCostUsd (numeric USD) alongside the raw aiProviderCost string.
 COST: Expensive — one API call per row. Batch subroutine follow-ups in parallel.`,
   {
     tableId: z.string().describe('Table ID (t_...) from a previous sync_table call'),
-    rowId: z.string().describe('Row ID (from get_rows results, found in the _rowId field)')
+    rowId:   z.string().describe('Row ID (from get_rows results, found in the _rowId field)'),
+    columns: z.array(z.string()).optional().describe('Allowlist of column names to include. _rowId and _credits are always returned. Omit to return all columns.'),
+    slim:    z.boolean().optional().default(false).describe('Drop fullContent from every cell to shrink the payload. Default false. Use when you only need value/status/credits.')
   },
-  async ({ tableId, rowId }) => {
+  async ({ tableId, rowId, columns, slim }) => {
     try {
       const schema = getSchema(tableId);
       const record = await getRecord(tableId, rowId);
       const formatted = formatRecord(record, schema);
 
+      let projected = formatted;
+      if (columns && columns.length > 0) {
+        const keep = new Set(columns);
+        const out = { _rowId: formatted._rowId };
+        if (formatted._credits) out._credits = formatted._credits;
+        for (const col of columns) {
+          if (col in formatted) out[col] = formatted[col];
+        }
+        projected = out;
+      }
+
+      if (slim) {
+        for (const [k, v] of Object.entries(projected)) {
+          if (k.startsWith('_')) continue;
+          if (v && typeof v === 'object' && 'fullContent' in v) {
+            const { fullContent, ...rest } = v;
+            projected[k] = rest;
+          }
+        }
+      }
+
       return {
-        content: [{ type: 'text', text: JSON.stringify(formatted, null, 2) }]
+        content: [{ type: 'text', text: JSON.stringify(projected, null, 2) }]
       };
     } catch (err) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: `Error fetching record: ${err.message}` }) }], isError: true };
@@ -1109,23 +1293,47 @@ COST: Expensive — one API call per row. Batch subroutine follow-ups in paralle
 
 server.tool(
   'get_credits',
-  `Calculate Clay credit cost — for a specific row OR aggregated across the table. One tool, three modes:
+  `Calculate full per-row cost — Clay credits AND AI provider $ — for a specific row OR aggregated across the table. One tool, three modes:
 
-  1. Specific row: pass rowId → that row's credit breakdown by column, INCLUDING the cost of any function (execute-subroutine) calls it triggered.
-  2. Sampled aggregate (default): omit rowId → samples sampleSize rows, aggregates, and extrapolates an estimated total table cost using the table's row count.
+  1. Specific row: pass rowId → that row's credit + AI breakdown by column, INCLUDING the cost of any function (execute-subroutine) calls it triggered.
+  2. Sampled aggregate (default): omit rowId → samples sampleSize rows, aggregates, and extrapolates an estimated total table cost (credits + AI $) using the table's row count.
   3. Full aggregate: omit rowId AND pass full=true → fetches every row. SLOW — one API call per row, more if rows trigger functions.
 
-CRITICAL: subroutine cost is BILLED ON THE FUNCTION ROW, not on the parent. The parent's execute-subroutine cell has credits=null. Real cost lives on the function row that ran. This tool follows fullContent.origin pointers to the function row(s) and rolls those credits into the parent's total. Without this, parent-only cost is undercounted — sometimes drastically.
+WHAT'S COVERED:
+  - Clay credits (upfront + additional). Cells with status SUCCESS_NO_DATA are zeroed out — Clay does NOT bill credits when a provider returns no data, even though the price tag is still in the cell payload.
+  - AI provider cost ($USD) from Use AI / Claygent columns, sourced from each cell's hiddenValue.costDetails.totalCostToAIProvider. Reported as aiCostUsd / aiProviderCostUsd everywhere alongside Clay credits.
+  - Subroutine cost is BILLED ON THE FUNCTION ROW, not the parent. The parent's execute-subroutine cell has credits=null. This tool follows fullContent.origin pointers and rolls function-row cost (credits AND AI $) into the parent's total.
+  - When a function row is unreachable (404 — pruned), the rollup falls back to the subroutine table's per-row mean (sampled and cached). subroutineDetail entries get status='404-estimated' so estimated calls are visible. Without this fallback, get_credits silently undercounts when subroutines have been garbage-collected.
 
 USE WHEN:
-  - "How much did row X cost" → mode 1.
+  - "How much did row X cost" / "what's the AI bill on this row" → mode 1.
   - "Average cost per row" / "what does this table cost to run" / "which column is most expensive" → mode 2 or 3.
 
 RETURNS: JSON.
-  Single-row: { rowId, status, direct, viaSubroutines, total, billedCellCount, byColumn, subroutineDetail: [{ column, functionTableId, functionRowId, status, direct, viaSubroutines, total }] }
-  Aggregate: { rowsAnalyzed, totalRowsInTable, sampled, subroutineDepth, perRow: { avg, avgDirect, avgViaSubroutines, min, max }, totalAcrossSample, extrapolatedTotalCredits, byColumn, bySubroutineColumn: [{ column, avgCreditsPerRow, totalAcrossSample, callsTriggered, callsUnreachable }] }
+  Single-row: {
+    rowId, status,
+    direct, directAiCostUsd,
+    viaSubroutines, viaSubroutinesAiCostUsd,
+    total, totalAiCostUsd,
+    billedCellCount, ranCellCount,
+    byColumn, subroutineDetail: [{ column, functionTableId, functionRowId, status, direct, directAiCostUsd, viaSubroutines, viaSubroutinesAiCostUsd, total, totalAiCostUsd, estimatedFromSample? }]
+  }
+  Aggregate: {
+    rowsAnalyzed, totalRowsInTable, sampled, subroutineDepth,
+    perRow: { avg, avgDirect, avgViaSubroutines, avgAiCostUsd, avgDirectAiCostUsd, avgViaSubroutinesAiCostUsd, min, max, minAiCostUsd, maxAiCostUsd },
+    totalAcrossSample: { direct, viaSubroutines, total, directAiCostUsd, viaSubroutinesAiCostUsd, totalAiCostUsd },
+    extrapolatedTotalCredits, extrapolatedTotalAiCostUsd,
+    byColumn:           [{ column, avgCreditsPerRow, avgAiCostUsdPerRow, totalCreditsAcrossSample, totalAiCostUsdAcrossSample, cellsRan, cellsBilled, triggerRatePct }],
+    bySubroutineColumn: [{ column, avgCreditsPerRow, avgAiCostUsdPerRow, totalCreditsAcrossSample, totalAiCostUsdAcrossSample, callsTriggered, callsReached, callsEstimated, callsUnreachable, callsDepthCapped, callsErrored, triggerRatePct }],
+    varianceHint?, subroutineCoverageHint?
+  }
 
-COST: 1 + N API calls per row analyzed (N = number of subroutine cells, recursive). Sampling 50 rows on a table with 2 subroutine columns at depth 2 ≈ 250 API calls.`,
+INTERPRETING byColumn:
+  - avgCreditsPerRow is the mean across ALL sampled rows, NOT the per-call cost. A column that fires on 30% of rows at 10 credits each will show avgCreditsPerRow≈3. Use triggerRatePct (cellsRan / rowsAnalyzed) to see how often the column actually runs. Use cellsBilled to see how often it was actually charged (cellsRan minus no-data passes).
+  - varianceHint fires when max/avg is large on a small sample — your avg is probably averaging over two populations (fully-firing rows and gated-out rows). Increase sampleSize for a tighter point estimate.
+  - subroutineCoverageHint fires when subroutine calls were 404 AND the fallback estimator couldn't sample the function table. Reported via-subroutine cost is undercounted in that case.
+
+COST: 1 + N API calls per row analyzed (N = number of subroutine cells, recursive). Sampling 50 rows on a table with 2 subroutine columns at depth 2 ≈ 250 API calls. The unreachable-fallback adds up to 10 extra calls per unreachable subroutine table (one-time, cached for the rest of the run).`,
   {
     tableId: z.string().describe('Table ID (t_...) from a previous sync_table call'),
     rowId: z.string().optional().describe('Row ID — omit to aggregate across the table'),
@@ -1166,6 +1374,8 @@ COST: 1 + N API calls per row analyzed (N = number of subroutine cells, recursiv
       }
 
       const n = rollups.length;
+
+      // Clay credits
       const sumDirect = rollups.reduce((s, r) => s + (r.direct || 0), 0);
       const sumVia    = rollups.reduce((s, r) => s + (r.viaSubroutines || 0), 0);
       const sumTotal  = rollups.reduce((s, r) => s + (r.total || 0), 0);
@@ -1173,49 +1383,129 @@ COST: 1 + N API calls per row analyzed (N = number of subroutine cells, recursiv
       const avgDirect = n > 0 ? sumDirect / n : 0;
       const avgVia    = n > 0 ? sumVia / n : 0;
 
-      const totals = rollups.map(r => r.total || 0);
-      const min = totals.reduce((m, v) => v < m ? v : m, Infinity);
-      const max = totals.reduce((m, v) => v > m ? v : m, -Infinity);
+      // AI provider cost (USD)
+      const sumDirectAi = rollups.reduce((s, r) => s + (r.directAiCostUsd || 0), 0);
+      const sumViaAi    = rollups.reduce((s, r) => s + (r.viaSubroutinesAiCostUsd || 0), 0);
+      const sumTotalAi  = rollups.reduce((s, r) => s + (r.totalAiCostUsd || 0), 0);
+      const avgAi       = n > 0 ? sumTotalAi / n : 0;
+      const avgDirectAi = n > 0 ? sumDirectAi / n : 0;
+      const avgViaAi    = n > 0 ? sumViaAi / n : 0;
 
-      // Direct columns aggregated across the sample
-      const byColumnSum = {};
-      const byColumnCount = {};
+      const totals = rollups.map(r => r.total || 0);
+      const aiTotals = rollups.map(r => r.totalAiCostUsd || 0);
+      const min      = totals.reduce((m, v) => v < m ? v : m, Infinity);
+      const max      = totals.reduce((m, v) => v > m ? v : m, -Infinity);
+      const minAi    = aiTotals.reduce((m, v) => v < m ? v : m, Infinity);
+      const maxAi    = aiTotals.reduce((m, v) => v > m ? v : m, -Infinity);
+
+      // Direct columns aggregated across the sample.
+      // cellsRan = how many of the n sampled rows actually had this cell
+      // executed (regardless of billing). cellsBilled = of those, how many
+      // were charged (Clay credits OR AI tokens). triggerRatePct =
+      // cellsRan/n is the right number for "does this column run on every
+      // row" — the previous version's avgCreditsPerRow could not distinguish
+      // between "5 credits × every row" and "10 credits × half the rows".
+      const byColumnAggregate = new Map();
       for (const r of rollups) {
         for (const c of r.byColumn) {
-          byColumnSum[c.column]   = (byColumnSum[c.column]   || 0) + (c.total || 0);
-          byColumnCount[c.column] = (byColumnCount[c.column] || 0) + 1;
+          if (!byColumnAggregate.has(c.column)) {
+            byColumnAggregate.set(c.column, {
+              sumCredits: 0, sumAiCostUsd: 0,
+              cellsRan: 0, cellsBilled: 0
+            });
+          }
+          const agg = byColumnAggregate.get(c.column);
+          agg.sumCredits   += c.total || 0;
+          agg.sumAiCostUsd += c.aiProviderCostUsd || 0;
+          agg.cellsRan     += 1;
+          if ((c.total || 0) > 0 || (c.aiProviderCostUsd || 0) > 0) agg.cellsBilled += 1;
         }
       }
-      const byColumn = Object.entries(byColumnSum).map(([col, sum]) => ({
-        column:            col,
-        avgCreditsPerRow:  sum / n,
-        totalAcrossSample: sum,
-        cellsBilled:       byColumnCount[col]
-      })).sort((a, b) => b.avgCreditsPerRow - a.avgCreditsPerRow);
+      const byColumn = Array.from(byColumnAggregate.entries()).map(([col, agg]) => ({
+        column:                     col,
+        avgCreditsPerRow:           agg.sumCredits / n,
+        avgAiCostUsdPerRow:         agg.sumAiCostUsd / n,
+        totalCreditsAcrossSample:   agg.sumCredits,
+        totalAiCostUsdAcrossSample: agg.sumAiCostUsd,
+        cellsRan:                   agg.cellsRan,
+        cellsBilled:                agg.cellsBilled,
+        triggerRatePct:             Math.round((agg.cellsRan / n) * 1000) / 10
+      })).sort((a, b) =>
+        ((b.avgCreditsPerRow + b.avgAiCostUsdPerRow * 100) -
+         (a.avgCreditsPerRow + a.avgAiCostUsdPerRow * 100))
+      );
 
       // Subroutine columns aggregated separately so the user can see
-      // "this column triggers a function that costs ~X credits per call"
-      const subSum = {};
-      const subCount = {};
-      const subUnreachable = {};
+      // "this column triggers a function that costs ~X credits per call".
+      // 404-estimated calls have already had their cost folded into
+      // r.viaSubroutines via the rollupCredits fallback path; we just
+      // surface the count separately so the user knows how many calls
+      // were estimated vs directly read.
+      const subroutineAggregate = new Map();
       for (const r of rollups) {
         for (const s of r.subroutineDetail || []) {
-          subSum[s.column]   = (subSum[s.column]   || 0) + (s.total || 0);
-          subCount[s.column] = (subCount[s.column] || 0) + 1;
-          if (s.status !== 'ok') subUnreachable[s.column] = (subUnreachable[s.column] || 0) + 1;
+          if (!subroutineAggregate.has(s.column)) {
+            subroutineAggregate.set(s.column, {
+              sumCredits: 0, sumAiCostUsd: 0,
+              callsTriggered: 0, callsReached: 0,
+              callsUnreachable: 0, callsEstimated: 0,
+              callsDepthCapped: 0, callsErrored: 0
+            });
+          }
+          const agg = subroutineAggregate.get(s.column);
+          agg.sumCredits     += s.total || 0;
+          agg.sumAiCostUsd   += s.totalAiCostUsd || 0;
+          agg.callsTriggered += 1;
+          if (s.status === 'ok')                  agg.callsReached     += 1;
+          else if (s.status === '404-estimated')  agg.callsEstimated   += 1;
+          else if (s.status === '404')            agg.callsUnreachable += 1;
+          else if (s.status === 'depth')          agg.callsDepthCapped += 1;
+          else if (s.status === 'cycle')          { /* ignored — already counted upstream */ }
+          else                                    agg.callsErrored     += 1;
         }
       }
-      const bySubroutineColumn = Object.entries(subSum).map(([col, sum]) => ({
-        column:            col,
-        avgCreditsPerRow:  sum / n,
-        totalAcrossSample: sum,
-        callsTriggered:    subCount[col],
-        callsUnreachable:  subUnreachable[col] || 0
-      })).sort((a, b) => b.avgCreditsPerRow - a.avgCreditsPerRow);
+      const bySubroutineColumn = Array.from(subroutineAggregate.entries()).map(([col, agg]) => ({
+        column:                     col,
+        avgCreditsPerRow:           agg.sumCredits / n,
+        avgAiCostUsdPerRow:         agg.sumAiCostUsd / n,
+        totalCreditsAcrossSample:   agg.sumCredits,
+        totalAiCostUsdAcrossSample: agg.sumAiCostUsd,
+        callsTriggered:             agg.callsTriggered,
+        callsReached:               agg.callsReached,
+        callsEstimated:             agg.callsEstimated,
+        callsUnreachable:           agg.callsUnreachable,
+        callsDepthCapped:           agg.callsDepthCapped,
+        callsErrored:               agg.callsErrored,
+        triggerRatePct:             Math.round((agg.callsTriggered / n) * 1000) / 10
+      })).sort((a, b) =>
+        ((b.avgCreditsPerRow + b.avgAiCostUsdPerRow * 100) -
+         (a.avgCreditsPerRow + a.avgAiCostUsdPerRow * 100))
+      );
 
       const totalRowsInTable = schema.rowCount ?? null;
       const extrapolatedTotalCredits = (!full && totalRowsInTable != null && n > 0)
         ? avg * totalRowsInTable
+        : null;
+      const extrapolatedTotalAiCostUsd = (!full && totalRowsInTable != null && n > 0)
+        ? avgAi * totalRowsInTable
+        : null;
+
+      // Variance hint — a small sample with a max well above the mean
+      // means the per-row cost is bimodal (some rows fire the full
+      // waterfall, others get gated out). Surface this so the user knows
+      // whether the avg is a confident point estimate or a fuzzy mean
+      // hiding two populations.
+      const spreadFactor = avg > 0 ? max / avg : 0;
+      const varianceHint = (n < 50 && spreadFactor >= 5)
+        ? `High variance: max=${max.toFixed(1)} is ${spreadFactor.toFixed(1)}× the avg of ${avg.toFixed(1)}. Per-row cost is likely bimodal (fully-firing vs gated-out rows). Increase sampleSize for a tighter estimate, or inspect min/max rows individually.`
+        : null;
+
+      // Subroutine-coverage hint — the previous undercount issue. If many
+      // calls were unreachable AND no fallback applied, the user should know
+      // their reported total is below true cost.
+      const unreachableNoFallback = bySubroutineColumn.reduce((s, c) => s + c.callsUnreachable, 0);
+      const subroutineCoverageHint = unreachableNoFallback > 0
+        ? `${unreachableNoFallback} subroutine call(s) pointed to function rows that could not be read AND the fallback estimator did not yield a usable mean. Reported via-subroutine cost is undercounted by an unknown amount.`
         : null;
 
       return {
@@ -1227,15 +1517,30 @@ COST: 1 + N API calls per row analyzed (N = number of subroutine cells, recursiv
           perRow:           {
             avg,
             avgDirect,
-            avgViaSubroutines: avgVia,
-            min:               n > 0 ? min : 0,
-            max:               n > 0 ? max : 0
+            avgViaSubroutines:          avgVia,
+            avgAiCostUsd:               avgAi,
+            avgDirectAiCostUsd:         avgDirectAi,
+            avgViaSubroutinesAiCostUsd: avgViaAi,
+            min:                        n > 0 ? min   : 0,
+            max:                        n > 0 ? max   : 0,
+            minAiCostUsd:               n > 0 ? minAi : 0,
+            maxAiCostUsd:               n > 0 ? maxAi : 0
           },
-          totalAcrossSample: { direct: sumDirect, viaSubroutines: sumVia, total: sumTotal },
+          totalAcrossSample: {
+            direct:                  sumDirect,
+            viaSubroutines:          sumVia,
+            total:                   sumTotal,
+            directAiCostUsd:         sumDirectAi,
+            viaSubroutinesAiCostUsd: sumViaAi,
+            totalAiCostUsd:          sumTotalAi
+          },
           extrapolatedTotalCredits,
+          extrapolatedTotalAiCostUsd,
           byColumn,
           bySubroutineColumn,
-          fetchErrors: fetchErrors.length > 0 ? fetchErrors : undefined
+          varianceHint:           varianceHint           || undefined,
+          subroutineCoverageHint: subroutineCoverageHint || undefined,
+          fetchErrors:            fetchErrors.length > 0 ? fetchErrors : undefined
         }, null, 2) }]
       };
     } catch (err) {

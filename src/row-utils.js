@@ -55,9 +55,37 @@ export function analyzeRowStatuses(rows, columnMap) {
 }
 
 /**
+ * Coerce Clay's AI-provider cost into a number of USD.
+ * Clay returns this as a dollar-prefixed string ("$0.28572") on most rows
+ * but occasionally as a bare number — handle both.
+ */
+export function parseDollarCost(val) {
+  if (val == null) return 0;
+  if (typeof val === 'number') return Number.isFinite(val) ? val : 0;
+  if (typeof val === 'string') {
+    const cleaned = val.replace(/[$,\s]/g, '');
+    const n = parseFloat(cleaned);
+    return Number.isFinite(n) ? n : 0;
+  }
+  return 0;
+}
+
+/**
  * Format a full record (from getRecord) with named columns and fullContent.
  * Includes per-cell credit usage from externalContent.upfrontCreditUsage /
  * additionalCreditUsage / hiddenValue.costDetails, and a _credits roll-up.
+ *
+ * Billing rules applied here:
+ *   - SUCCESS_NO_DATA → Clay does NOT bill credits even though the cell
+ *     payload still carries the action's price tag in upfrontCreditUsage.
+ *     We zero out 'upfront' and 'additional' for billing math but preserve
+ *     the original sum as 'wouldBeCredits' (with noData: true) so callers
+ *     can still see what the column would have cost if data had returned.
+ *   - aiProviderCost is NOT covered by the no-data rule — LLM tokens were
+ *     spent regardless of whether the action returned data, so the AI $
+ *     cost is reported as-is. The numeric form is exposed as
+ *     aiProviderCostUsd; the raw Clay-formatted string lives on
+ *     aiProviderCost.
  *
  * This projection drops noise (full action-definition copy, retry history,
  * UI strings) that would inflate token cost ~10x without adding judgment
@@ -69,8 +97,11 @@ export function formatRecord(record, schema) {
     columnMap[f.id] = f.name;
   }
 
-  let totalCredits = 0;
-  let cellsWithCredits = 0;
+  let totalCredits     = 0;
+  let totalAiCostUsd   = 0;
+  let totalWouldBe     = 0;
+  let cellsBilled      = 0; // cells where billed total > 0 OR aiCost > 0
+  let cellsRan         = 0; // cells with any credit metadata attached
 
   const formatted = { _rowId: record.id };
   for (const [fieldId, cell] of Object.entries(record.cells || {})) {
@@ -81,32 +112,52 @@ export function formatRecord(record, schema) {
     const upfront    = ext.upfrontCreditUsage?.totalCost ?? null;
     const additional = ext.additionalCreditUsage?.totalCost ?? null;
     const aiCost     = ext.hiddenValue?.costDetails?.totalCostToAIProvider ?? null;
+    const status     = cell.metadata?.status || null;
 
     const out = {
       value:       cell.value ?? null,
-      status:      cell.metadata?.status || null,
+      status,
       fullContent: ext.fullValue ?? null
     };
 
     if (upfront != null || additional != null || aiCost != null) {
-      const cellTotal = (upfront ?? 0) + (additional ?? 0);
+      const noData            = status === 'SUCCESS_NO_DATA';
+      const wouldBeUpfront    = upfront ?? 0;
+      const wouldBeAdditional = additional ?? 0;
+      const billedUpfront     = noData ? 0 : (upfront ?? 0);
+      const billedAdditional  = noData ? 0 : (additional ?? 0);
+      const cellTotal         = billedUpfront + billedAdditional;
+      const cellAiCostUsd     = parseDollarCost(aiCost);
+
       out.credits = {
-        total:          cellTotal,
-        upfront:        upfront,
-        additional:     additional,
-        aiProviderCost: aiCost
+        total:             cellTotal,
+        upfront:           noData ? 0 : upfront,
+        additional:        noData ? 0 : additional,
+        aiProviderCost:    aiCost,
+        aiProviderCostUsd: cellAiCostUsd
       };
-      totalCredits     += cellTotal;
-      cellsWithCredits += 1;
+      if (noData) {
+        out.credits.wouldBeCredits = wouldBeUpfront + wouldBeAdditional;
+        out.credits.noData         = true;
+        totalWouldBe += wouldBeUpfront + wouldBeAdditional;
+      }
+
+      totalCredits   += cellTotal;
+      totalAiCostUsd += cellAiCostUsd;
+      cellsRan       += 1;
+      if (cellTotal > 0 || cellAiCostUsd > 0) cellsBilled += 1;
     }
 
     formatted[name] = out;
   }
 
-  if (cellsWithCredits > 0) {
+  if (cellsRan > 0) {
     formatted._credits = {
-      total:           totalCredits,
-      billedCellCount: cellsWithCredits
+      total:             totalCredits,
+      aiProviderCostUsd: totalAiCostUsd,
+      billedCellCount:   cellsBilled,
+      ranCellCount:      cellsRan,
+      ...(totalWouldBe > 0 ? { wouldBeCreditsFromNoData: totalWouldBe } : {})
     };
   }
 
