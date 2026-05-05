@@ -92,17 +92,38 @@ async function createSession({ anthropicKey, agentId, environmentId, vaultId }) 
       vault_ids: vaultId ? [vaultId] : [],
     }),
   });
-  if (!res.ok) throw new Error(`session create failed: ${res.status} ${await res.text()}`);
-  return (await res.json()).id;
+  const text = await res.text();
+  if (!res.ok) throw new Error(`session create failed: ${res.status} ${text}`);
+  let json;
+  try { json = JSON.parse(text); } catch { throw new Error(`session create returned non-JSON: ${text.slice(0, 200)}`); }
+  const id = json.id || json.session?.id || json.data?.id;
+  console.error('[slack] session created:', id, '(raw keys:', Object.keys(json).join(','), ')');
+  if (!id) throw new Error(`no session id in response: ${text.slice(0, 200)}`);
+  return id;
 }
 
 async function streamReply({ anthropicKey }, sessionId, message) {
-  const streamRes = await fetch(
+  const candidates = [
     `https://api.anthropic.com/v1/sessions/${sessionId}/stream?beta=true`,
-    { headers: { ...anthropicHeaders(anthropicKey), Accept: 'text/event-stream' } }
-  );
-  if (!streamRes.ok || !streamRes.body) {
-    throw new Error(`stream open failed: ${streamRes.status} ${await streamRes.text()}`);
+    `https://api.anthropic.com/v1/sessions/${sessionId}/events/stream?beta=true`,
+    `https://api.anthropic.com/v1/sessions/${sessionId}/stream`,
+  ];
+  let streamRes;
+  let lastErr = '';
+  for (const url of candidates) {
+    console.error('[slack] trying stream URL:', url);
+    streamRes = await fetch(url, {
+      headers: { ...anthropicHeaders(anthropicKey), Accept: 'text/event-stream' },
+    });
+    if (streamRes.ok && streamRes.body) {
+      console.error('[slack] stream opened at:', url);
+      break;
+    }
+    lastErr = `${streamRes.status} ${await streamRes.text()}`;
+    console.error('[slack] stream URL failed:', url, lastErr);
+  }
+  if (!streamRes?.ok || !streamRes.body) {
+    throw new Error(`stream open failed: ${lastErr}`);
   }
 
   const sendPromise = fetch(`https://api.anthropic.com/v1/sessions/${sessionId}/events`, {
