@@ -5,6 +5,7 @@ const ANTHROPIC_VERSION = '2023-06-01';
 
 const threadSessions = new Map();
 const seenEventIds = new Set();
+const seenMessages = new Set();
 
 export function verifySlackSignature(req, signingSecret) {
   const ts = req.headers['x-slack-request-timestamp'];
@@ -45,11 +46,26 @@ export async function handleSlackEvents(req, res, config) {
 
   res.status(200).send();
 
-  if (body.type !== 'event_callback' || body.event?.type !== 'app_mention') {
-    return;
-  }
+  if (body.type !== 'event_callback') return;
+  const event = body.event;
+  if (!event) return;
 
-  const { text, channel, thread_ts, ts } = body.event;
+  const isMention = event.type === 'app_mention';
+  const isThreadFollowup =
+    event.type === 'message' &&
+    !event.bot_id &&
+    (!event.subtype || event.subtype === 'thread_broadcast') &&
+    event.thread_ts &&
+    threadSessions.has(event.thread_ts);
+
+  if (!isMention && !isThreadFollowup) return;
+
+  const messageKey = `${event.channel}:${event.ts}`;
+  if (seenMessages.has(messageKey)) return;
+  seenMessages.add(messageKey);
+  if (seenMessages.size > 1000) seenMessages.clear();
+
+  const { text, channel, thread_ts, ts } = event;
   const threadKey = thread_ts || ts;
   const cleanText = (text || '').replace(/<@[A-Z0-9]+>/g, '').trim();
 
