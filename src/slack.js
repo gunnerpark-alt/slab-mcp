@@ -218,6 +218,7 @@ async function streamReply({ anthropicKey }, sessionId, message, onProgress) {
   const decoder = new TextDecoder();
   let buffer = '';
   let finalText = '';
+  const seenEventTypes = new Set();
 
   outer: while (true) {
     const { value, done } = await reader.read();
@@ -231,6 +232,13 @@ async function streamReply({ anthropicKey }, sessionId, message, onProgress) {
       if (!data) continue;
       let evt;
       try { evt = JSON.parse(data); } catch { continue; }
+      if (evt.type && !seenEventTypes.has(evt.type)) {
+        seenEventTypes.add(evt.type);
+        console.error('[slack][stream-event-type]', evt.type, '→ keys:', Object.keys(evt).join(','));
+        if (/tool|skill|thinking/i.test(evt.type)) {
+          console.error('[slack][stream-event-sample]', JSON.stringify(evt).slice(0, 800));
+        }
+      }
       if (evt.type === 'agent.message' && Array.isArray(evt.content)) {
         for (const block of evt.content) {
           if (block.type === 'text' && block.text) finalText += block.text;
