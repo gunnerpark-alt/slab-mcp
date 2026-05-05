@@ -81,11 +81,17 @@ export function parseDollarCost(val) {
  *   ERROR_RUN_CONDITION_NOT_MET  — gate didn't pass, column never executed
  *   ERROR_BAD_REQUEST            — request rejected before the provider
  *                                  was called (no upstream charge possible)
+ *   ERROR_BLANK_TOKEN            — required input variable was empty;
+ *                                  action didn't fire (defensive — Clay
+ *                                  currently doesn't attach a price tag
+ *                                  to these cells, but if that changes we
+ *                                  shouldn't bill them)
  */
 const NOT_BILLED_STATUSES = new Set([
   'SUCCESS_NO_DATA',
   'ERROR_RUN_CONDITION_NOT_MET',
-  'ERROR_BAD_REQUEST'
+  'ERROR_BAD_REQUEST',
+  'ERROR_BLANK_TOKEN'
 ]);
 
 /**
@@ -95,10 +101,10 @@ const NOT_BILLED_STATUSES = new Set([
  * the cells that count as "this column ran on this row" for trigger-rate
  * accounting.
  *
- * Excludes ERROR_RUN_CONDITION_NOT_MET, HAS_NOT_RUN, QUEUED — those cells
- * were prepared (price tag attached) but did not execute. Counting them
- * as "ran" is what produced the original 100%-trigger artifact for
- * gated waterfall columns like Enrich Person.
+ * Excludes ERROR_RUN_CONDITION_NOT_MET, ERROR_BLANK_TOKEN, HAS_NOT_RUN,
+ * QUEUED — those cells were prepared (price tag may be attached) but did
+ * not execute. Counting them as "ran" is what produced the original
+ * 100%-trigger artifact for gated waterfall columns like Enrich Person.
  */
 const EXECUTED_STATUSES = new Set([
   'SUCCESS',
@@ -110,7 +116,8 @@ const EXECUTED_STATUSES = new Set([
 const NOT_BILLED_REASON = {
   SUCCESS_NO_DATA:             'no-data',
   ERROR_RUN_CONDITION_NOT_MET: 'gated',
-  ERROR_BAD_REQUEST:           'bad-request'
+  ERROR_BAD_REQUEST:           'bad-request',
+  ERROR_BLANK_TOKEN:           'blank-input'
 };
 
 /**
@@ -196,10 +203,12 @@ export function formatRecord(record, schema) {
         out.credits.wouldBeCredits   = wouldBeUpfront + wouldBeAdditional;
         out.credits.notBilledReason  = NOT_BILLED_REASON[status] || 'unknown';
         totalWouldBe += wouldBeUpfront + wouldBeAdditional;
-      } else if (status === 'ERROR') {
+      } else if (status === 'ERROR' && (cellTotal > 0 || cellAiCostUsd > 0)) {
         // Provider responded but with an error — Clay's billing behavior
         // here is ambiguous (sometimes charged, sometimes not depending on
-        // where the failure occurred). Surface so the caller can decide.
+        // where the failure occurred). Only flag cells that ACTUALLY have
+        // non-zero cost; otherwise the flag is noise (integration columns
+        // with status=ERROR but upfront=0 used to spuriously trip this).
         out.credits.billingAmbiguous = true;
       }
 

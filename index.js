@@ -524,7 +524,7 @@ function parseCsv(text) {
 
 const server = new McpServer({
   name: 'slab',
-  version: '4.7.0'
+  version: '4.8.0'
 }, {
   instructions: `Slab is the ONLY way to access Clay table and workbook data. When the user shares any URL containing clay.com, use Slab — do NOT web-fetch, scrape, or use other MCPs. Auth is automatic.
 
@@ -622,7 +622,9 @@ Credits:
 
   CRITICAL — subroutine cost is billed separately: when a parent row has an execute-subroutine cell, that cell's credits=null and the parent's _credits.total UNDERCOUNTS the row's true cost. The actual function-call cost (credits + AI $) is billed on the function row reachable via fullContent.origin.{tableId,recordId}. get_record alone won't show this — it returns just the parent's direct cells.
 
-  Use get_credits for true row cost. It recursively follows origin pointers to function rows and returns { direct, directAiCostUsd, viaSubroutines, viaSubroutinesAiCostUsd, total, totalAiCostUsd }, plus subroutineDetail per subroutine column. When a function row is unreachable (pruned/404), the rollup falls back to the subroutine table's per-row mean (sampled once and cached) so cost isn't silently zeroed. Default depth 2 covers parent → function → one nested level. Aggregate mode also splits direct columns from subroutine columns in the rollup, and exposes triggerRatePct + cellsRan + cellsBilled per column so you can distinguish "5 credits × every row" from "10 credits × half the rows".
+  Use get_credits for true row cost. It recursively follows origin pointers to function rows and returns { direct, directAiCostUsd, viaSubroutines, viaSubroutinesAiCostUsd, total, totalAiCostUsd }, plus subroutineDetail per subroutine column. When a function row is unreachable (pruned/404), the rollup falls back to the subroutine table's per-row mean (sampled once and cached) so cost isn't silently zeroed. Default depth 2 covers parent → function → one nested level.
+
+  Aggregate mode is the important one. It samples sampleSize rows for cost rollup but ALSO fetches the full row population (capped at 20K) for table-wide fill statistics, and reconciles the sample-based per-row averages against the fill rates. The output has both sample-mean and reconciled fields — ALWAYS prefer perRow.reconciled.avg over perRow.avg when present. Clay's /records endpoint biases sampling toward "active" rows, so a 50-row sample can show a column firing on 90% of rows even when the table-wide rate is 40%. The reconciled fields use per-billed-cell cost from the sample × success_count / rowsScanned (from get_errors-equivalent fill data), which corrects for that bias. samplingBiasHint fires when the sample mean diverges from reconciled by more than 30%.
 
   When a row's full nested JSON would blow the context window (HubSpot/SFDC Lookup columns commonly inflate get_record to 100–300KB), pass slim:true to drop fullContent, or columns=[...] to project to specific fields. Both keep credits/aiProviderCostUsd intact.
 
@@ -1321,18 +1323,30 @@ RETURNS: JSON.
   }
   Aggregate: {
     rowsAnalyzed, totalRowsInTable, sampled, subroutineDepth,
-    perRow: { avg, avgDirect, avgViaSubroutines, avgAiCostUsd, avgDirectAiCostUsd, avgViaSubroutinesAiCostUsd, min, max, minAiCostUsd, maxAiCostUsd },
+    perRow: {
+      avg, avgDirect, avgViaSubroutines, avgAiCostUsd, avgDirectAiCostUsd, avgViaSubroutinesAiCostUsd, min, max, minAiCostUsd, maxAiCostUsd,
+      reconciled?: { avg, avgDirect, avgViaSubroutines, avgAiCostUsd, avgDirectAiCostUsd, avgViaSubroutinesAiCostUsd, rowsScanned }
+    },
     totalAcrossSample: { direct, viaSubroutines, total, directAiCostUsd, viaSubroutinesAiCostUsd, totalAiCostUsd },
     extrapolatedTotalCredits, extrapolatedTotalAiCostUsd,
-    byColumn:           [{ column, avgCreditsPerRow, avgAiCostUsdPerRow, totalCreditsAcrossSample, totalAiCostUsdAcrossSample, cellsRan, cellsPriced, cellsBilled, triggerRatePct, wouldBeCreditsAcrossSample?, cellsAmbiguous? }],
-    bySubroutineColumn: [{ column, avgCreditsPerRow, avgAiCostUsdPerRow, totalCreditsAcrossSample, totalAiCostUsdAcrossSample, callsTriggered, callsReached, callsEstimated, callsUnreachable, callsDepthCapped, callsErrored, triggerRatePct }],
-    varianceHint?, subroutineCoverageHint?
+    byColumn:           [{ column, avgCreditsPerRow, avgAiCostUsdPerRow, avgCreditsPerBilledCell, avgAiCostUsdPerBilledCell, totalCreditsAcrossSample, totalAiCostUsdAcrossSample, cellsRan, cellsPriced, cellsBilled, triggerRatePct, reconciled?, wouldBeCreditsAcrossSample?, cellsAmbiguous? }],
+    bySubroutineColumn: [{ column, avgCreditsPerRow, avgAiCostUsdPerRow, avgCreditsPerCall, avgAiCostUsdPerCall, totalCreditsAcrossSample, totalAiCostUsdAcrossSample, callsTriggered, callsReached, callsEstimated, callsUnreachable, callsDepthCapped, callsErrored, triggerRatePct, reconciled? }],
+    samplingBiasHint?, varianceHint?, subroutineCoverageHint?
   }
 
 INTERPRETING byColumn:
-  - avgCreditsPerRow is the mean across ALL sampled rows, NOT the per-call cost. A column that fires on 30% of rows at 10 credits each will show avgCreditsPerRow≈3. Use triggerRatePct (cellsRan / rowsAnalyzed) to see how often the column actually runs. Use cellsBilled to see how often it was actually charged (cellsRan minus no-data passes).
-  - varianceHint fires when max/avg is large on a small sample — your avg is probably averaging over two populations (fully-firing rows and gated-out rows). Increase sampleSize for a tighter point estimate.
-  - subroutineCoverageHint fires when subroutine calls were 404 AND the fallback estimator couldn't sample the function table. Reported via-subroutine cost is undercounted in that case.
+  - SAMPLE-BASED FIELDS (avgCreditsPerRow, etc.) are the mean across the sampleSize sampled rows. They are NOT the per-call cost and they are biased — Clay's /records endpoint returns rows in non-random order, often over-representing recently-active rows where waterfalls fire more.
+  - avgCreditsPerBilledCell is the per-call cost when actually billed (sumCredits / cellsBilled). Use this, not avgCreditsPerRow, when computing "what does this column cost per call".
+  - triggerRatePct is the SAMPLE trigger rate (cellsRan/n). Compare against reconciled.triggerRatePctTable to spot sample bias on a per-column basis.
+  - reconciled (when present) is the table-wide truth: per-billed-cell cost × table-wide success count / table rows. Authoritative — use this for cost projections, not the sample-mean fields.
+  - reconciled.samplingBiasFactor > 1 means the sample over-represents this column firing; < 1 means under-represents.
+
+WHEN TO TRUST WHAT:
+  - perRow.reconciled.avg present → use that. It's the right per-row average.
+  - perRow.reconciled absent (table too small for fill stats, or all columns lacked sample billing data) → fall back to perRow.avg, but treat as approximate.
+  - samplingBiasHint fires → sample is significantly biased; do not use the sample-mean fields for projections.
+  - varianceHint fires when max/avg is large on a small sample — bimodal distribution (fully-firing vs gated-out rows). Increase sampleSize.
+  - subroutineCoverageHint fires when subroutine calls were 404 AND the fallback estimator couldn't sample the function table. Reported via-subroutine cost is undercounted.
 
 COST: 1 + N API calls per row analyzed (N = number of subroutine cells, recursive). Sampling 50 rows on a table with 2 subroutine columns at depth 2 ≈ 250 API calls. The unreachable-fallback adds up to 10 extra calls per unreachable subroutine table (one-time, cached for the rest of the run).`,
   {
@@ -1356,9 +1370,24 @@ COST: 1 + N API calls per row analyzed (N = number of subroutine cells, recursiv
       }
 
       // Modes 2 + 3: aggregate
-      const listLimit = full ? undefined : sampleSize;
-      const listed = await listRows(tableId, schema.viewId, { limit: listLimit });
-      const rowIds = listed.map(r => r.id).filter(Boolean);
+      //
+      // We always fetch the full row population (capped at RECORDS_API_CAP)
+      // even in sample mode — the extra rows give us table-wide fill stats
+      // for free, which we use to reconcile per-row cost estimates against
+      // the (typically biased) sample. Clay's /records endpoint isn't
+      // randomly ordered, so a 50-row sample of an active table can show
+      // wildly different trigger rates from the table as a whole.
+      const listed = await listRows(tableId, schema.viewId);
+      const rowsAvailable = listed.length;
+
+      // Compute fill stats across the full population. Same data get_errors
+      // returns. Used below to reconcile sampled per-row cost.
+      const columnMap = buildColumnMap(schema);
+      const fillStats = analyzeRowStatuses(listed, columnMap);
+
+      // Sample row IDs to actually rollup (cheap if full mode).
+      const sampledListed = full ? listed : listed.slice(0, sampleSize);
+      const rowIds = sampledListed.map(r => r.id).filter(Boolean);
 
       const rollups = [];
       const fetchErrors = [];
@@ -1440,27 +1469,71 @@ COST: 1 + N API calls per row analyzed (N = number of subroutine cells, recursiv
           if ((c.total || 0) > 0 || (c.aiProviderCostUsd || 0) > 0) agg.cellsBilled += 1;
         }
       }
-      const byColumn = Array.from(byColumnAggregate.entries()).map(([col, agg]) => ({
-        column:                     col,
-        avgCreditsPerRow:           agg.sumCredits / n,
-        avgAiCostUsdPerRow:         agg.sumAiCostUsd / n,
-        totalCreditsAcrossSample:   agg.sumCredits,
-        totalAiCostUsdAcrossSample: agg.sumAiCostUsd,
-        cellsRan:                   agg.cellsRan,
-        cellsPriced:                agg.cellsPriced,
-        cellsBilled:                agg.cellsBilled,
-        triggerRatePct:             Math.round((agg.cellsRan / n) * 1000) / 10,
-        ...(agg.sumWouldBeCredits > 0 ? {
-          wouldBeCreditsAcrossSample: agg.sumWouldBeCredits
-        } : {}),
-        ...(agg.cellsAmbiguous > 0 ? {
-          cellsAmbiguous:           agg.cellsAmbiguous,
-          ambiguousNote:            'These cells have status=ERROR with a price tag. Clay billing is ambiguous — included in totals but flagged.'
-        } : {})
-      })).sort((a, b) =>
-        ((b.avgCreditsPerRow + b.avgAiCostUsdPerRow * 100) -
-         (a.avgCreditsPerRow + a.avgAiCostUsdPerRow * 100))
-      );
+      // Helper: look up a column's table-wide fill stats by name. Used to
+      // reconcile sample-based per-row averages against table-wide truth.
+      const fieldIdByName = {};
+      for (const f of schema.fields) fieldIdByName[f.name] = f.id;
+      const fillStatsFor = (columnName) => {
+        const fid = fieldIdByName[columnName];
+        return fid ? fillStats[fid] : null;
+      };
+
+      const byColumn = Array.from(byColumnAggregate.entries()).map(([col, agg]) => {
+        const avgCreditsPerBilledCell  = agg.cellsBilled > 0 ? agg.sumCredits   / agg.cellsBilled : 0;
+        const avgAiCostUsdPerBilledCell = agg.cellsBilled > 0 ? agg.sumAiCostUsd / agg.cellsBilled : 0;
+
+        // Reconciled per-row: scale per-billed-cell cost by the column's
+        // table-wide success rate. This is what corrects for /records
+        // sampling bias — a column that fires on 30% of rows table-wide
+        // but 90% of sample rows will have a sample avg ~3x the true mean.
+        // Only ERROR cells with cost > 0 are not part of `success`; we
+        // currently exclude them from reconciled (treating Clay's billing
+        // on those as ambiguous).
+        const stats = fillStatsFor(col);
+        let reconciled = null;
+        if (stats && rowsAvailable > 0 && agg.cellsBilled > 0) {
+          const tableTriggerRate = (stats.success + stats.error) / rowsAvailable;
+          const sampleTriggerRate = agg.cellsRan / n;
+          reconciled = {
+            successCount:       stats.success,
+            rowsScanned:        rowsAvailable,
+            triggerRatePctTable: Math.round(tableTriggerRate * 1000) / 10,
+            avgCreditsPerRow:   avgCreditsPerBilledCell  * stats.success / rowsAvailable,
+            avgAiCostUsdPerRow: avgAiCostUsdPerBilledCell * stats.success / rowsAvailable,
+            samplingBiasFactor: tableTriggerRate > 0
+              ? Math.round((sampleTriggerRate / tableTriggerRate) * 100) / 100
+              : null
+          };
+        }
+
+        return {
+          column:                     col,
+          avgCreditsPerRow:           agg.sumCredits / n,
+          avgAiCostUsdPerRow:         agg.sumAiCostUsd / n,
+          avgCreditsPerBilledCell,
+          avgAiCostUsdPerBilledCell,
+          totalCreditsAcrossSample:   agg.sumCredits,
+          totalAiCostUsdAcrossSample: agg.sumAiCostUsd,
+          cellsRan:                   agg.cellsRan,
+          cellsPriced:                agg.cellsPriced,
+          cellsBilled:                agg.cellsBilled,
+          triggerRatePct:             Math.round((agg.cellsRan / n) * 1000) / 10,
+          ...(reconciled ? { reconciled } : {}),
+          ...(agg.sumWouldBeCredits > 0 ? {
+            wouldBeCreditsAcrossSample: agg.sumWouldBeCredits
+          } : {}),
+          ...(agg.cellsAmbiguous > 0 ? {
+            cellsAmbiguous:           agg.cellsAmbiguous,
+            ambiguousNote:            'These cells have status=ERROR with non-zero cost. Clay billing is ambiguous — included in totals but flagged.'
+          } : {})
+        };
+      }).sort((a, b) => {
+        const aWeight = (a.reconciled?.avgCreditsPerRow ?? a.avgCreditsPerRow)
+                      + (a.reconciled?.avgAiCostUsdPerRow ?? a.avgAiCostUsdPerRow) * 100;
+        const bWeight = (b.reconciled?.avgCreditsPerRow ?? b.avgCreditsPerRow)
+                      + (b.reconciled?.avgAiCostUsdPerRow ?? b.avgAiCostUsdPerRow) * 100;
+        return bWeight - aWeight;
+      });
 
       // Subroutine columns aggregated separately so the user can see
       // "this column triggers a function that costs ~X credits per call".
@@ -1491,30 +1564,80 @@ COST: 1 + N API calls per row analyzed (N = number of subroutine cells, recursiv
           else                                    agg.callsErrored     += 1;
         }
       }
-      const bySubroutineColumn = Array.from(subroutineAggregate.entries()).map(([col, agg]) => ({
-        column:                     col,
-        avgCreditsPerRow:           agg.sumCredits / n,
-        avgAiCostUsdPerRow:         agg.sumAiCostUsd / n,
-        totalCreditsAcrossSample:   agg.sumCredits,
-        totalAiCostUsdAcrossSample: agg.sumAiCostUsd,
-        callsTriggered:             agg.callsTriggered,
-        callsReached:               agg.callsReached,
-        callsEstimated:             agg.callsEstimated,
-        callsUnreachable:           agg.callsUnreachable,
-        callsDepthCapped:           agg.callsDepthCapped,
-        callsErrored:               agg.callsErrored,
-        triggerRatePct:             Math.round((agg.callsTriggered / n) * 1000) / 10
-      })).sort((a, b) =>
-        ((b.avgCreditsPerRow + b.avgAiCostUsdPerRow * 100) -
-         (a.avgCreditsPerRow + a.avgAiCostUsdPerRow * 100))
-      );
+      const bySubroutineColumn = Array.from(subroutineAggregate.entries()).map(([col, agg]) => {
+        const avgPerCall   = agg.callsTriggered > 0 ? agg.sumCredits   / agg.callsTriggered : 0;
+        const avgAiPerCall = agg.callsTriggered > 0 ? agg.sumAiCostUsd / agg.callsTriggered : 0;
+        const stats = fillStatsFor(col);
+
+        let reconciled = null;
+        if (stats && rowsAvailable > 0 && agg.callsTriggered > 0) {
+          const tableTriggerRate = stats.success / rowsAvailable;
+          const sampleTriggerRate = agg.callsTriggered / n;
+          reconciled = {
+            successCount:       stats.success,
+            rowsScanned:        rowsAvailable,
+            triggerRatePctTable: Math.round(tableTriggerRate * 1000) / 10,
+            avgCreditsPerRow:   avgPerCall   * stats.success / rowsAvailable,
+            avgAiCostUsdPerRow: avgAiPerCall * stats.success / rowsAvailable,
+            samplingBiasFactor: tableTriggerRate > 0
+              ? Math.round((sampleTriggerRate / tableTriggerRate) * 100) / 100
+              : null
+          };
+        }
+
+        return {
+          column:                     col,
+          avgCreditsPerRow:           agg.sumCredits / n,
+          avgAiCostUsdPerRow:         agg.sumAiCostUsd / n,
+          avgCreditsPerCall:          avgPerCall,
+          avgAiCostUsdPerCall:        avgAiPerCall,
+          totalCreditsAcrossSample:   agg.sumCredits,
+          totalAiCostUsdAcrossSample: agg.sumAiCostUsd,
+          callsTriggered:             agg.callsTriggered,
+          callsReached:               agg.callsReached,
+          callsEstimated:             agg.callsEstimated,
+          callsUnreachable:           agg.callsUnreachable,
+          callsDepthCapped:           agg.callsDepthCapped,
+          callsErrored:               agg.callsErrored,
+          triggerRatePct:             Math.round((agg.callsTriggered / n) * 1000) / 10,
+          ...(reconciled ? { reconciled } : {})
+        };
+      }).sort((a, b) => {
+        const aWeight = (a.reconciled?.avgCreditsPerRow ?? a.avgCreditsPerRow)
+                      + (a.reconciled?.avgAiCostUsdPerRow ?? a.avgAiCostUsdPerRow) * 100;
+        const bWeight = (b.reconciled?.avgCreditsPerRow ?? b.avgCreditsPerRow)
+                      + (b.reconciled?.avgAiCostUsdPerRow ?? b.avgAiCostUsdPerRow) * 100;
+        return bWeight - aWeight;
+      });
+
+      // Reconciled per-row totals — sum each column's reconciled contribution.
+      // This is the table-wide truth (modulo ERROR-cell ambiguity), not the
+      // sample mean. Available whenever fill stats produced a reconciled
+      // entry for at least one column.
+      const reconciledColumnsExist = byColumn.some(c => c.reconciled)
+                                  || bySubroutineColumn.some(c => c.reconciled);
+      const reconciledAvgDirect = byColumn.reduce((s, c) =>
+        s + (c.reconciled?.avgCreditsPerRow || 0), 0);
+      const reconciledAvgVia = bySubroutineColumn.reduce((s, c) =>
+        s + (c.reconciled?.avgCreditsPerRow || 0), 0);
+      const reconciledAvgDirectAi = byColumn.reduce((s, c) =>
+        s + (c.reconciled?.avgAiCostUsdPerRow || 0), 0);
+      const reconciledAvgViaAi = bySubroutineColumn.reduce((s, c) =>
+        s + (c.reconciled?.avgAiCostUsdPerRow || 0), 0);
+      const reconciledAvg   = reconciledAvgDirect   + reconciledAvgVia;
+      const reconciledAvgAi = reconciledAvgDirectAi + reconciledAvgViaAi;
 
       const totalRowsInTable = schema.rowCount ?? null;
-      const extrapolatedTotalCredits = (!full && totalRowsInTable != null && n > 0)
-        ? avg * totalRowsInTable
+      // Prefer reconciled when available — it's based on table-wide success
+      // counts rather than the (often biased) sample mean.
+      const extrapolationBase   = reconciledColumnsExist ? reconciledAvg   : avg;
+      const extrapolationBaseAi = reconciledColumnsExist ? reconciledAvgAi : avgAi;
+      const rowsForExtrapolation = totalRowsInTable ?? rowsAvailable;
+      const extrapolatedTotalCredits = (!full && rowsForExtrapolation != null && n > 0)
+        ? extrapolationBase * rowsForExtrapolation
         : null;
-      const extrapolatedTotalAiCostUsd = (!full && totalRowsInTable != null && n > 0)
-        ? avgAi * totalRowsInTable
+      const extrapolatedTotalAiCostUsd = (!full && rowsForExtrapolation != null && n > 0)
+        ? extrapolationBaseAi * rowsForExtrapolation
         : null;
 
       // Variance hint — a small sample with a max well above the mean
@@ -1535,6 +1658,21 @@ COST: 1 + N API calls per row analyzed (N = number of subroutine cells, recursiv
         ? `${unreachableNoFallback} subroutine call(s) pointed to function rows that could not be read AND the fallback estimator did not yield a usable mean. Reported via-subroutine cost is undercounted by an unknown amount.`
         : null;
 
+      // Sampling-bias hint — Clay's /records endpoint is not random-order,
+      // so sample averages can diverge significantly from table-wide truth.
+      // Compare the sample mean to the reconciled mean (which uses table-wide
+      // success counts × per-billed-cell cost from the sample). If they
+      // differ by more than 30%, warn loudly and tell the user to use the
+      // reconciled values, not the sample averages.
+      let samplingBiasHint = null;
+      if (reconciledColumnsExist && reconciledAvg > 0 && avg > 0) {
+        const ratio = avg / reconciledAvg;
+        if (ratio >= 1.3 || ratio <= 0.77) {
+          const direction = ratio > 1 ? 'OVER-counts' : 'UNDER-counts';
+          samplingBiasHint = `Sample mean (${avg.toFixed(2)} cr/row) ${direction} table reality (${reconciledAvg.toFixed(2)} cr/row reconciled) by ${ratio.toFixed(2)}×. Clay's /records endpoint biases toward "active" rows; the sample over-represents heavily-enriched rows. Use perRow.reconciled and byColumn[].reconciled.avgCreditsPerRow — those are weighted by table-wide fill rates from get_errors data and are the right number for cost projections.`;
+        }
+      }
+
       return {
         content: [{ type: 'text', text: JSON.stringify({
           rowsAnalyzed:     n,
@@ -1551,7 +1689,19 @@ COST: 1 + N API calls per row analyzed (N = number of subroutine cells, recursiv
             min:                        n > 0 ? min   : 0,
             max:                        n > 0 ? max   : 0,
             minAiCostUsd:               n > 0 ? minAi : 0,
-            maxAiCostUsd:               n > 0 ? maxAi : 0
+            maxAiCostUsd:               n > 0 ? maxAi : 0,
+            ...(reconciledColumnsExist ? {
+              reconciled: {
+                avg:                        reconciledAvg,
+                avgDirect:                  reconciledAvgDirect,
+                avgViaSubroutines:          reconciledAvgVia,
+                avgAiCostUsd:               reconciledAvgAi,
+                avgDirectAiCostUsd:         reconciledAvgDirectAi,
+                avgViaSubroutinesAiCostUsd: reconciledAvgViaAi,
+                rowsScanned:                rowsAvailable,
+                note:                       'Reconciled per-row uses table-wide success counts × per-billed-cell cost from the sample. Authoritative when present — use these instead of the sample-mean values above for cost projections.'
+              }
+            } : {})
           },
           totalAcrossSample: {
             direct:                  sumDirect,
@@ -1565,6 +1715,7 @@ COST: 1 + N API calls per row analyzed (N = number of subroutine cells, recursiv
           extrapolatedTotalAiCostUsd,
           byColumn,
           bySubroutineColumn,
+          samplingBiasHint:       samplingBiasHint       || undefined,
           varianceHint:           varianceHint           || undefined,
           subroutineCoverageHint: subroutineCoverageHint || undefined,
           fetchErrors:            fetchErrors.length > 0 ? fetchErrors : undefined
