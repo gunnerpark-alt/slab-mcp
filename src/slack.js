@@ -119,7 +119,7 @@ export async function handleSlackEvents(req, res, config) {
     placeholderTs = await postMessage(config.botToken, channel, threadKey, ':hourglass_flowing_sand: _Working on it…_');
     const reply = await streamReply(config, sessionId, cleanText, onProgress);
     if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
-    await updateOrPost(config.botToken, channel, threadKey, placeholderTs, reply || '_(empty response)_');
+    await updateOrPost(config.botToken, channel, threadKey, placeholderTs, toSlackMrkdwn(reply) || '_(empty response)_');
   } catch (err) {
     console.error('Slack handler error:', err);
     if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
@@ -185,6 +185,21 @@ function formatToolArgs(name, input) {
 
 function truncate(s, n) {
   return s.length > n ? s.slice(0, n - 1) + '…' : s;
+}
+
+function toSlackMrkdwn(text) {
+  if (!text) return text;
+  const segments = text.split(/(```[\s\S]*?```|`[^`\n]+`)/g);
+  return segments
+    .map((seg, i) => {
+      if (i % 2 === 1) return seg;
+      return seg
+        .replace(/^#{1,6}\s+(.+)$/gm, '*$1*')
+        .replace(/\*\*([^*\n]+?)\*\*/g, '*$1*')
+        .replace(/__([^_\n]+?)__/g, '_$1_')
+        .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<$2|$1>');
+    })
+    .join('');
 }
 
 async function postMessage(botToken, channel, thread_ts, text) {
