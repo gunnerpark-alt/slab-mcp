@@ -58,17 +58,19 @@ export async function handleSlackEvents(req, res, config) {
     return;
   }
 
+  let placeholderTs = null;
   try {
     let sessionId = threadSessions.get(threadKey);
     if (!sessionId) {
       sessionId = await createSession(config);
       threadSessions.set(threadKey, sessionId);
     }
+    placeholderTs = await postMessage(config.botToken, channel, threadKey, ':hourglass_flowing_sand: _Working on it…_');
     const reply = await streamReply(config, sessionId, cleanText);
-    await postMessage(config.botToken, channel, threadKey, reply || '_(empty response)_');
+    await updateOrPost(config.botToken, channel, threadKey, placeholderTs, reply || '_(empty response)_');
   } catch (err) {
     console.error('Slack handler error:', err);
-    await postMessage(config.botToken, channel, threadKey, `:warning: ${err.message}`);
+    await updateOrPost(config.botToken, channel, threadKey, placeholderTs, `:warning: ${err.message}`);
   }
 }
 
@@ -79,7 +81,26 @@ async function postMessage(botToken, channel, thread_ts, text) {
     body: JSON.stringify({ channel, thread_ts, text }),
   });
   const json = await res.json();
-  if (!json.ok) console.error('chat.postMessage failed:', json);
+  if (!json.ok) {
+    console.error('chat.postMessage failed:', json);
+    return null;
+  }
+  return json.ts;
+}
+
+async function updateOrPost(botToken, channel, thread_ts, ts, text) {
+  if (!ts) return postMessage(botToken, channel, thread_ts, text);
+  const res = await fetch('https://slack.com/api/chat.update', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${botToken}` },
+    body: JSON.stringify({ channel, ts, text }),
+  });
+  const json = await res.json();
+  if (!json.ok) {
+    console.error('chat.update failed:', json);
+    return postMessage(botToken, channel, thread_ts, text);
+  }
+  return json.ts;
 }
 
 async function createSession({ anthropicKey, agentId, environmentId, vaultId }) {
@@ -92,38 +113,17 @@ async function createSession({ anthropicKey, agentId, environmentId, vaultId }) 
       vault_ids: vaultId ? [vaultId] : [],
     }),
   });
-  const text = await res.text();
-  if (!res.ok) throw new Error(`session create failed: ${res.status} ${text}`);
-  let json;
-  try { json = JSON.parse(text); } catch { throw new Error(`session create returned non-JSON: ${text.slice(0, 200)}`); }
-  const id = json.id || json.session?.id || json.data?.id;
-  console.error('[slack] session created:', id, '(raw keys:', Object.keys(json).join(','), ')');
-  if (!id) throw new Error(`no session id in response: ${text.slice(0, 200)}`);
-  return id;
+  if (!res.ok) throw new Error(`session create failed: ${res.status} ${await res.text()}`);
+  return (await res.json()).id;
 }
 
 async function streamReply({ anthropicKey }, sessionId, message) {
-  const candidates = [
-    `https://api.anthropic.com/v1/sessions/${sessionId}/stream?beta=true`,
+  const streamRes = await fetch(
     `https://api.anthropic.com/v1/sessions/${sessionId}/events/stream?beta=true`,
-    `https://api.anthropic.com/v1/sessions/${sessionId}/stream`,
-  ];
-  let streamRes;
-  let lastErr = '';
-  for (const url of candidates) {
-    console.error('[slack] trying stream URL:', url);
-    streamRes = await fetch(url, {
-      headers: { ...anthropicHeaders(anthropicKey), Accept: 'text/event-stream' },
-    });
-    if (streamRes.ok && streamRes.body) {
-      console.error('[slack] stream opened at:', url);
-      break;
-    }
-    lastErr = `${streamRes.status} ${await streamRes.text()}`;
-    console.error('[slack] stream URL failed:', url, lastErr);
-  }
-  if (!streamRes?.ok || !streamRes.body) {
-    throw new Error(`stream open failed: ${lastErr}`);
+    { headers: { ...anthropicHeaders(anthropicKey), Accept: 'text/event-stream' } }
+  );
+  if (!streamRes.ok || !streamRes.body) {
+    throw new Error(`stream open failed: ${streamRes.status} ${await streamRes.text()}`);
   }
 
   const sendPromise = fetch(`https://api.anthropic.com/v1/sessions/${sessionId}/events`, {
