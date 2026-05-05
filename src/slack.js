@@ -136,16 +136,51 @@ function renderTrace(trace) {
   return lines.join('\n');
 }
 
-function formatToolArgs(_name, input) {
+function formatToolArgs(name, input) {
   if (!input || typeof input !== 'object') return '';
-  if (typeof input.url === 'string') return ` ${truncate(input.url, 70)}`;
-  if (typeof input._rowId === 'string') return ` row \`${input._rowId}\``;
-  if (typeof input.column === 'string') return ` column \`${input.column}\``;
-  if (typeof input.tableId === 'string') return ` \`${input.tableId}\``;
-  if (typeof input.query === 'string') return ` "${truncate(input.query, 50)}"`;
-  if (typeof input.command === 'string') return ` \`${truncate(input.command, 50)}\``;
-  if (typeof input.path === 'string') return ` \`${truncate(input.path, 50)}\``;
-  return '';
+  switch (name) {
+    case 'sync_table':
+    case 'sync_workbook':
+      return '';
+    case 'get_rows': {
+      if (input.query) return ` query "${truncate(input.query, 50)}"`;
+      if (input.identifier_column) return ` column \`${input.identifier_column}\``;
+      if (input.view) return ` view "${input.view}"`;
+      return '';
+    }
+    case 'export_csv':
+      return input.view ? ` view "${input.view}"` : '';
+    case 'find_rows': {
+      const parts = [];
+      if (input.column) parts.push(`column \`${input.column}\``);
+      if (Array.isArray(input.values)) parts.push(`${input.values.length} values`);
+      return parts.length ? ` ${parts.join(', ')}` : '';
+    }
+    case 'get_record':
+      return input.rowId ? ` row \`${input.rowId}\`` : '';
+    case 'get_credits':
+      if (input.rowId) return ` row \`${input.rowId}\``;
+      if (input.full) return ' full table';
+      return ` sample (${input.sampleSize || 50})`;
+    case 'get_errors':
+      return input.view ? ` view "${input.view}"` : '';
+    case 'web_search':
+      return input.query ? ` "${truncate(input.query, 60)}"` : '';
+    case 'web_fetch':
+      return input.url ? ` ${truncate(input.url, 60)}` : '';
+    case 'bash':
+      return input.command ? ` \`${truncate(input.command, 60)}\`` : '';
+    case 'read':
+    case 'write':
+    case 'edit':
+      return input.file_path ? ` \`${truncate(input.file_path, 50)}\`` : '';
+    case 'glob':
+      return input.pattern ? ` \`${input.pattern}\`` : '';
+    case 'grep':
+      return input.pattern ? ` /${truncate(input.pattern, 40)}/` : '';
+    default:
+      return '';
+  }
 }
 
 function truncate(s, n) {
