@@ -75,6 +75,41 @@ export async function handleSlackEvents(req, res, config) {
   }
 
   let placeholderTs = null;
+  const trace = { steps: [] };
+  let pendingTimer = null;
+  let lastFlush = 0;
+  let dirty = false;
+
+  const flush = async () => {
+    pendingTimer = null;
+    if (!dirty || !placeholderTs) return;
+    dirty = false;
+    lastFlush = Date.now();
+    try {
+      await updateOrPost(config.botToken, channel, threadKey, placeholderTs, renderTrace(trace));
+    } catch (e) {
+      console.error('progress update failed:', e);
+    }
+  };
+  const scheduleUpdate = () => {
+    dirty = true;
+    if (pendingTimer) return;
+    pendingTimer = setTimeout(flush, Math.max(0, 800 - (Date.now() - lastFlush)));
+  };
+  const onProgress = (ev) => {
+    if (ev.kind === 'tool_use') {
+      trace.steps.push({ id: ev.id, name: ev.name, args: formatToolArgs(ev.name, ev.input), status: 'running' });
+      if (trace.steps.length > 10) trace.steps.shift();
+      scheduleUpdate();
+    } else if (ev.kind === 'tool_result') {
+      const step = trace.steps.find((s) => s.id === ev.id);
+      if (step) {
+        step.status = ev.isError ? 'error' : 'done';
+        scheduleUpdate();
+      }
+    }
+  };
+
   try {
     let sessionId = threadSessions.get(threadKey);
     if (!sessionId) {
@@ -82,12 +117,39 @@ export async function handleSlackEvents(req, res, config) {
       threadSessions.set(threadKey, sessionId);
     }
     placeholderTs = await postMessage(config.botToken, channel, threadKey, ':hourglass_flowing_sand: _Working on it…_');
-    const reply = await streamReply(config, sessionId, cleanText);
+    const reply = await streamReply(config, sessionId, cleanText, onProgress);
+    if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
     await updateOrPost(config.botToken, channel, threadKey, placeholderTs, reply || '_(empty response)_');
   } catch (err) {
     console.error('Slack handler error:', err);
+    if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
     await updateOrPost(config.botToken, channel, threadKey, placeholderTs, `:warning: ${err.message}`);
   }
+}
+
+function renderTrace(trace) {
+  const lines = [':hourglass_flowing_sand: _Working on it…_', ''];
+  for (const step of trace.steps) {
+    const icon = step.status === 'done' ? ':white_check_mark:' : step.status === 'error' ? ':warning:' : ':wrench:';
+    lines.push(`${icon} \`${step.name}\`${step.args}`);
+  }
+  return lines.join('\n');
+}
+
+function formatToolArgs(_name, input) {
+  if (!input || typeof input !== 'object') return '';
+  if (typeof input.url === 'string') return ` ${truncate(input.url, 70)}`;
+  if (typeof input._rowId === 'string') return ` row \`${input._rowId}\``;
+  if (typeof input.column === 'string') return ` column \`${input.column}\``;
+  if (typeof input.tableId === 'string') return ` \`${input.tableId}\``;
+  if (typeof input.query === 'string') return ` "${truncate(input.query, 50)}"`;
+  if (typeof input.command === 'string') return ` \`${truncate(input.command, 50)}\``;
+  if (typeof input.path === 'string') return ` \`${truncate(input.path, 50)}\``;
+  return '';
+}
+
+function truncate(s, n) {
+  return s.length > n ? s.slice(0, n - 1) + '…' : s;
 }
 
 async function postMessage(botToken, channel, thread_ts, text) {
@@ -133,7 +195,7 @@ async function createSession({ anthropicKey, agentId, environmentId, vaultId }) 
   return (await res.json()).id;
 }
 
-async function streamReply({ anthropicKey }, sessionId, message) {
+async function streamReply({ anthropicKey }, sessionId, message, onProgress) {
   const streamRes = await fetch(
     `https://api.anthropic.com/v1/sessions/${sessionId}/events/stream?beta=true`,
     { headers: { ...anthropicHeaders(anthropicKey), Accept: 'text/event-stream' } }
@@ -173,6 +235,14 @@ async function streamReply({ anthropicKey }, sessionId, message) {
         for (const block of evt.content) {
           if (block.type === 'text' && block.text) finalText += block.text;
         }
+      } else if (evt.type === 'agent.mcp_tool_use' || evt.type === 'agent.tool_use') {
+        const name = evt.name || evt.tool_name || evt.tool?.name || 'tool';
+        const id = evt.id || evt.tool_use_id || evt.tool?.id;
+        const input = evt.input || evt.tool?.input || {};
+        if (onProgress && id) onProgress({ kind: 'tool_use', id, name, input });
+      } else if (evt.type === 'agent.mcp_tool_result' || evt.type === 'agent.tool_result') {
+        const id = evt.tool_use_id || evt.id;
+        if (onProgress && id) onProgress({ kind: 'tool_result', id, isError: !!evt.is_error });
       } else if (evt.type === 'session.status_idle') {
         break outer;
       } else if (evt.type === 'session.error') {
