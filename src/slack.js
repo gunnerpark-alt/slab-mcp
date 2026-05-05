@@ -218,7 +218,6 @@ async function streamReply({ anthropicKey }, sessionId, message, onProgress) {
   const decoder = new TextDecoder();
   let buffer = '';
   let finalText = '';
-  const seenEventTypes = new Set();
 
   outer: while (true) {
     const { value, done } = await reader.read();
@@ -232,26 +231,15 @@ async function streamReply({ anthropicKey }, sessionId, message, onProgress) {
       if (!data) continue;
       let evt;
       try { evt = JSON.parse(data); } catch { continue; }
-      if (evt.type && !seenEventTypes.has(evt.type)) {
-        seenEventTypes.add(evt.type);
-        console.error('[slack][stream-event-type]', evt.type, '→ keys:', Object.keys(evt).join(','));
-        if (/tool|skill|thinking/i.test(evt.type)) {
-          console.error('[slack][stream-event-sample]', JSON.stringify(evt).slice(0, 800));
-        }
-      }
       if (evt.type === 'agent.message' && Array.isArray(evt.content)) {
         for (const block of evt.content) {
           if (block.type === 'text' && block.text) finalText += block.text;
         }
       } else if (evt.type === 'agent.mcp_tool_use' || evt.type === 'agent.tool_use') {
-        console.error('[slack][tool_use] raw event:', JSON.stringify(evt).slice(0, 500));
-        const name = evt.name || evt.tool_name || evt.tool?.name || evt.tool_use?.name || 'tool';
-        const id = evt.id || evt.tool_use_id || evt.tool?.id || evt.tool_use?.id;
-        const input = evt.input || evt.tool?.input || evt.tool_use?.input || {};
-        if (onProgress && id) onProgress({ kind: 'tool_use', id, name, input });
+        const id = evt.id;
+        if (onProgress && id) onProgress({ kind: 'tool_use', id, name: evt.name || 'tool', input: evt.input || {} });
       } else if (evt.type === 'agent.mcp_tool_result' || evt.type === 'agent.tool_result') {
-        console.error('[slack][tool_result] raw event:', JSON.stringify(evt).slice(0, 300));
-        const id = evt.tool_use_id || evt.id || evt.tool_result?.tool_use_id;
+        const id = evt.tool_use_id;
         if (onProgress && id) onProgress({ kind: 'tool_result', id, isError: !!evt.is_error });
       } else if (evt.type === 'session.status_idle') {
         break outer;
