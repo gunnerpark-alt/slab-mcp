@@ -28,6 +28,7 @@ import { z } from 'zod';
 
 import { getTableSchema, listRows, getRecord, getWorkbookTables, getAllRecords, searchRecords, exportTableToCsv, fetchCsv, RECORDS_API_CAP } from './src/clay-api.js';
 import { analyzeRowStatuses, formatRecord } from './src/row-utils.js';
+import { handleSlackEvents } from './src/slack.js';
 
 // ---------------------------------------------------------------------------
 // In-memory caches (lifetime: MCP server process)
@@ -1837,9 +1838,30 @@ if (transportMode === 'http') {
   }
 
   const app = express();
-  app.use(express.json({ limit: '4mb' }));
+  app.use(express.json({
+    limit: '4mb',
+    verify: (req, _res, buf) => { req.rawBody = buf.toString('utf8'); },
+  }));
 
   app.get('/healthz', (_req, res) => res.status(200).json({ ok: true }));
+
+  const slackConfig = {
+    signingSecret: process.env.SLACK_SIGNING_SECRET || '',
+    botToken: process.env.SLACK_BOT_TOKEN || '',
+    anthropicKey: process.env.ANTHROPIC_API_KEY || '',
+    agentId: process.env.MANAGED_AGENT_ID || '',
+    environmentId: process.env.MANAGED_ENVIRONMENT_ID || '',
+    vaultId: process.env.MANAGED_VAULT_ID || '',
+  };
+  app.post('/slack/events', (req, res) => {
+    const missing = ['signingSecret', 'botToken', 'anthropicKey', 'agentId', 'environmentId']
+      .filter((k) => !slackConfig[k]);
+    if (missing.length) {
+      console.error('slack route missing env:', missing);
+      return res.status(503).json({ error: 'slack bot not configured', missing });
+    }
+    return handleSlackEvents(req, res, slackConfig);
+  });
 
   const requireBearer = (req, res, next) => {
     const provided = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');

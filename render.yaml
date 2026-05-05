@@ -16,3 +16,15 @@ services:
         sync: false
       - key: MCP_BEARER_TOKEN
         sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: SLACK_BOT_TOKEN
+        sync: false
+      - key: SLACK_SIGNING_SECRET
+        sync: false
+      - key: MANAGED_AGENT_ID
+        sync: false
+      - key: MANAGED_ENVIRONMENT_ID
+        sync: false
+      - key: MANAGED_VAULT_ID
+        sync: false
