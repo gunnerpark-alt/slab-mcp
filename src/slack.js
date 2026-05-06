@@ -123,7 +123,6 @@ export async function handleSlackEvents(req, res, config) {
     const finalPayload = renderFinalMessage({
       trace,
       replyMrkdwn,
-      userPrompt: cleanText,
       elapsedMs: Date.now() - startMs,
     });
     await updateOrPost(config.botToken, channel, threadKey, placeholderTs, finalPayload);
@@ -137,7 +136,6 @@ export async function handleSlackEvents(req, res, config) {
 const LIVE_TRACE_TAIL = 10;
 const SECTION_TEXT_LIMIT = 2900;
 const TRACE_RESULT_PREVIEW = 240;
-const TRACE_REQUEST_PREVIEW = 240;
 
 function traceLine(step) {
   const icon = step.status === 'done' ? ':white_check_mark:' : step.status === 'error' ? ':warning:' : ':wrench:';
@@ -154,17 +152,15 @@ function renderTrace(trace) {
   return lines.join('\n');
 }
 
-function renderFinalMessage({ trace, replyMrkdwn, userPrompt, elapsedMs }) {
+function renderFinalMessage({ trace, replyMrkdwn, elapsedMs }) {
   const blocks = answerBlocks(replyMrkdwn);
   blocks.push({
     type: 'context',
     elements: [{ type: 'mrkdwn', text: footerText(trace, elapsedMs) }],
   });
-  return {
-    text: notificationText(replyMrkdwn),
-    blocks,
-    attachments: [traceAttachment(trace, userPrompt, replyMrkdwn)],
-  };
+  const payload = { text: notificationText(replyMrkdwn), blocks };
+  if (trace.steps.length) payload.attachments = [traceAttachment(trace)];
+  return payload;
 }
 
 function answerBlocks(mrkdwn) {
@@ -184,15 +180,9 @@ function answerBlocks(mrkdwn) {
   return blocks;
 }
 
-function traceAttachment(trace, userPrompt, replyMrkdwn) {
+function traceAttachment(trace) {
   const lines = ['*✅ Slab*'];
-  if (userPrompt) lines.push(`*Request:* ${truncate(userPrompt.replace(/\s+/g, ' ').trim(), TRACE_REQUEST_PREVIEW)}`);
-  if (trace.steps.length) {
-    lines.push('*Working:*');
-    for (const step of trace.steps) lines.push(traceLine(step));
-  }
-  const preview = previewText(replyMrkdwn);
-  if (preview) lines.push(`*Result:* ${preview}`);
+  for (const step of trace.steps) lines.push(traceLine(step));
   return {
     color: 'good',
     blocks: [{ type: 'section', text: { type: 'mrkdwn', text: lines.join('\n').slice(0, SECTION_TEXT_LIMIT) } }],
@@ -275,13 +265,17 @@ function truncate(s, n) {
 
 function toSlackMrkdwn(text) {
   if (!text) return text;
-  const segments = text.split(/(```[\s\S]*?```|`[^`\n]+`)/g);
+  // Convert **bold** → *bold* before splitting on code spans, so that pairs
+  // straddling an inline code span (e.g. `**Step 8 — \`column\`**`) still
+  // match. The inner-class allows backticks/spaces but forbids `*` and
+  // newlines, which keeps the match local.
+  const preBolded = text.replace(/\*\*([^*\n]+?)\*\*/g, '*$1*');
+  const segments = preBolded.split(/(```[\s\S]*?```|`[^`\n]+`)/g);
   return segments
     .map((seg, i) => {
       if (i % 2 === 1) return seg;
       return seg
         .replace(/^#{1,6}\s+(.+)$/gm, '*$1*')
-        .replace(/\*\*([^*\n]+?)\*\*/g, '*$1*')
         .replace(/__([^_\n]+?)__/g, '_$1_')
         .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<$2|$1>');
     })
