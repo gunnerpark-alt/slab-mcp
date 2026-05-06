@@ -47,8 +47,13 @@ export async function getTableSchema(tableId, viewId) {
   const activeView     = gridViews.find(v => v.id === viewId);
   const viewFieldOrder = activeView?.fieldOrder || [];
 
+  // Schema = full table fields, not view-filtered. The view's fieldOrder
+  // only governs display priority (visible columns first, hidden appended).
+  // A custom view with a partial fieldOrder used to silently drop fields
+  // that exist on the table but aren't exposed in that view's UI.
+  const visibleSet      = new Set(viewFieldOrder);
   const orderedFieldIds = viewFieldOrder.length > 0
-    ? viewFieldOrder
+    ? [...viewFieldOrder, ...fields.map(f => f.id).filter(id => !visibleSet.has(id))]
     : fields.map(f => f.id);
 
   const orderedFields = [];
@@ -57,11 +62,12 @@ export async function getTableSchema(tableId, viewId) {
     const field = fields.find(f => f.id === fieldId);
     if (!field) continue;
     orderedFields.push({
-      id:           field.id,
-      name:         field.name,
-      type:         field.type,
-      typeSettings: field.typeSettings || null,
-      pricing:      field.actionDefinition?.pricing || null
+      id:            field.id,
+      name:          field.name,
+      type:          field.type,
+      typeSettings:  field.typeSettings || null,
+      pricing:       field.actionDefinition?.pricing || null,
+      visibleInView: viewFieldOrder.length === 0 || visibleSet.has(field.id)
     });
   }
 

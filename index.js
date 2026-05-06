@@ -120,7 +120,11 @@ async function syncTableRecursive(tableId, viewId, {
     if (visited.size >= maxTotal) return;
     visited.add(id);
 
-    let schema = schemaCache.get(id);
+    // Root table always refetches: an explicit sync_table call should
+    // never return cached schema. Subroutines stay cached — the parent's
+    // edits don't propagate to them, and sync_workbook treats external
+    // subroutines the same way.
+    let schema = depth === 0 ? null : schemaCache.get(id);
     if (!schema) {
       schema = await getTableSchema(id, view);
       schemaCache.set(id, schema);
@@ -649,13 +653,15 @@ When the user asks to WRITE, FIX, or REVIEW a Clay formula or a Claygent / Use A
 
 server.tool(
   'sync_table',
-  `Fetch and cache a Clay table's schema. Recursively auto-syncs any subroutines (functions invoked via execute-subroutine) up to depth 3, max 20 tables.
+  `Fetch a Clay table's schema fresh from Clay every call. Recursively auto-syncs any subroutines (functions invoked via execute-subroutine) up to depth 3, max 20 tables.
 
 USE WHEN: URL contains /tables/ (and not /workbooks/).
 DON'T USE WHEN: URL contains /workbooks/ → use sync_workbook.
 RETURNS: JSON object — { rootSchema: { tableId, viewId, tableName, rowCount, fieldCount, views, fields }, subroutines: [{ tableId, depth, invokedBy, schema }] }.
 
-Each field includes full typeSettings (formula text, prompts, inputsBinding, run conditions) and 'pricing' on action fields. Read these directly — nothing is truncated.`,
+Each field includes full typeSettings (formula text, prompts, inputsBinding, run conditions), 'pricing' on action fields, and 'visibleInView' indicating whether the field is exposed in the URL's view. Read these directly — nothing is truncated.
+
+The root table is always refetched (never served from cache); the schema's capturedAt reflects the current call. Subroutines stay cached across calls within the same session — re-call sync_table on a subroutine's URL directly to refresh it.`,
   { url: z.string().describe('Clay table URL, e.g. https://app.clay.com/tables/t_xxx/views/gv_yyy') },
   async ({ url }) => {
     const { tableId, viewId } = parseClayUrl(url);
