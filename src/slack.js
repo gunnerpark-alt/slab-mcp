@@ -76,6 +76,7 @@ export async function handleSlackEvents(req, res, config) {
 
   let placeholderTs = null;
   const trace = { steps: [] };
+  const startMs = Date.now();
   let pendingTimer = null;
   let lastFlush = 0;
   let dirty = false;
@@ -99,7 +100,6 @@ export async function handleSlackEvents(req, res, config) {
   const onProgress = (ev) => {
     if (ev.kind === 'tool_use') {
       trace.steps.push({ id: ev.id, name: ev.name, args: formatToolArgs(ev.name, ev.input), status: 'running' });
-      if (trace.steps.length > 10) trace.steps.shift();
       scheduleUpdate();
     } else if (ev.kind === 'tool_result') {
       const step = trace.steps.find((s) => s.id === ev.id);
@@ -119,7 +119,14 @@ export async function handleSlackEvents(req, res, config) {
     placeholderTs = await postMessage(config.botToken, channel, threadKey, ':hourglass_flowing_sand: _Working on it…_');
     const reply = await streamReply(config, sessionId, cleanText, onProgress);
     if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
-    await updateOrPost(config.botToken, channel, threadKey, placeholderTs, toSlackMrkdwn(reply) || '_(empty response)_');
+    const replyMrkdwn = toSlackMrkdwn(reply) || '_(empty response)_';
+    const finalPayload = renderFinalMessage({
+      trace,
+      replyMrkdwn,
+      userPrompt: cleanText,
+      elapsedMs: Date.now() - startMs,
+    });
+    await updateOrPost(config.botToken, channel, threadKey, placeholderTs, finalPayload);
   } catch (err) {
     console.error('Slack handler error:', err);
     if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
@@ -127,13 +134,92 @@ export async function handleSlackEvents(req, res, config) {
   }
 }
 
+const LIVE_TRACE_TAIL = 10;
+const SECTION_TEXT_LIMIT = 2900;
+const TRACE_RESULT_PREVIEW = 240;
+const TRACE_REQUEST_PREVIEW = 240;
+
+function traceLine(step) {
+  const icon = step.status === 'done' ? ':white_check_mark:' : step.status === 'error' ? ':warning:' : ':wrench:';
+  return `${icon} \`${step.name}\`${step.args}`;
+}
+
 function renderTrace(trace) {
   const lines = [':hourglass_flowing_sand: _Working on it…_', ''];
-  for (const step of trace.steps) {
-    const icon = step.status === 'done' ? ':white_check_mark:' : step.status === 'error' ? ':warning:' : ':wrench:';
-    lines.push(`${icon} \`${step.name}\`${step.args}`);
+  const recent = trace.steps.slice(-LIVE_TRACE_TAIL);
+  if (trace.steps.length > recent.length) {
+    lines.push(`_+${trace.steps.length - recent.length} earlier step(s)…_`);
   }
+  for (const step of recent) lines.push(traceLine(step));
   return lines.join('\n');
+}
+
+function renderFinalMessage({ trace, replyMrkdwn, userPrompt, elapsedMs }) {
+  const blocks = answerBlocks(replyMrkdwn);
+  blocks.push({
+    type: 'context',
+    elements: [{ type: 'mrkdwn', text: footerText(trace, elapsedMs) }],
+  });
+  return {
+    text: notificationText(replyMrkdwn),
+    blocks,
+    attachments: [traceAttachment(trace, userPrompt, replyMrkdwn)],
+  };
+}
+
+function answerBlocks(mrkdwn) {
+  const blocks = [];
+  let buf = '';
+  for (const para of String(mrkdwn).split(/\n{2,}/)) {
+    const next = buf ? `${buf}\n\n${para}` : para;
+    if (next.length > SECTION_TEXT_LIMIT && buf) {
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: buf } });
+      buf = para;
+    } else {
+      buf = next;
+    }
+  }
+  if (buf) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: buf.slice(0, SECTION_TEXT_LIMIT) } });
+  if (blocks.length === 0) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: '_(empty response)_' } });
+  return blocks;
+}
+
+function traceAttachment(trace, userPrompt, replyMrkdwn) {
+  const lines = ['*✅ Slab*'];
+  if (userPrompt) lines.push(`*Request:* ${truncate(userPrompt.replace(/\s+/g, ' ').trim(), TRACE_REQUEST_PREVIEW)}`);
+  if (trace.steps.length) {
+    lines.push('*Working:*');
+    for (const step of trace.steps) lines.push(traceLine(step));
+  }
+  const preview = previewText(replyMrkdwn);
+  if (preview) lines.push(`*Result:* ${preview}`);
+  return {
+    color: 'good',
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: lines.join('\n').slice(0, SECTION_TEXT_LIMIT) } }],
+  };
+}
+
+function footerText(trace, elapsedMs) {
+  const seconds = (Math.max(0, elapsedMs) / 1000).toFixed(1);
+  const n = trace.steps.length;
+  return `Slab · ${seconds}s · ${n} tool ${n === 1 ? 'call' : 'calls'}`;
+}
+
+function previewText(mrkdwn) {
+  if (!mrkdwn) return '';
+  const stripped = String(mrkdwn)
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/<([^|>]+)\|([^>]+)>/g, '$2')
+    .replace(/[*_]+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return truncate(stripped, TRACE_RESULT_PREVIEW);
+}
+
+function notificationText(mrkdwn) {
+  const p = previewText(mrkdwn);
+  return p || 'Slab reply';
 }
 
 function formatToolArgs(name, input) {
@@ -202,11 +288,15 @@ function toSlackMrkdwn(text) {
     .join('');
 }
 
-async function postMessage(botToken, channel, thread_ts, text) {
+function asPayload(payload) {
+  return typeof payload === 'string' ? { text: payload } : payload;
+}
+
+async function postMessage(botToken, channel, thread_ts, payload) {
   const res = await fetch('https://slack.com/api/chat.postMessage', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${botToken}` },
-    body: JSON.stringify({ channel, thread_ts, text }),
+    body: JSON.stringify({ channel, thread_ts, ...asPayload(payload) }),
   });
   const json = await res.json();
   if (!json.ok) {
@@ -216,17 +306,17 @@ async function postMessage(botToken, channel, thread_ts, text) {
   return json.ts;
 }
 
-async function updateOrPost(botToken, channel, thread_ts, ts, text) {
-  if (!ts) return postMessage(botToken, channel, thread_ts, text);
+async function updateOrPost(botToken, channel, thread_ts, ts, payload) {
+  if (!ts) return postMessage(botToken, channel, thread_ts, payload);
   const res = await fetch('https://slack.com/api/chat.update', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${botToken}` },
-    body: JSON.stringify({ channel, ts, text }),
+    body: JSON.stringify({ channel, ts, ...asPayload(payload) }),
   });
   const json = await res.json();
   if (!json.ok) {
     console.error('chat.update failed:', json);
-    return postMessage(botToken, channel, thread_ts, text);
+    return postMessage(botToken, channel, thread_ts, payload);
   }
   return json.ts;
 }
