@@ -275,13 +275,17 @@ function truncate(s, n) {
 
 function toSlackMrkdwn(text) {
   if (!text) return text;
-  const segments = text.split(/(```[\s\S]*?```|`[^`\n]+`)/g);
+  // Convert **bold** → *bold* before splitting on code spans, so that pairs
+  // straddling an inline code span (e.g. `**Step 8 — \`column\`**`) still
+  // match. The inner-class allows backticks/spaces but forbids `*` and
+  // newlines, which keeps the match local.
+  const preBolded = text.replace(/\*\*([^*\n]+?)\*\*/g, '*$1*');
+  const segments = preBolded.split(/(```[\s\S]*?```|`[^`\n]+`)/g);
   return segments
     .map((seg, i) => {
       if (i % 2 === 1) return seg;
       return seg
         .replace(/^#{1,6}\s+(.+)$/gm, '*$1*')
-        .replace(/\*\*([^*\n]+?)\*\*/g, '*$1*')
         .replace(/__([^_\n]+?)__/g, '_$1_')
         .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<$2|$1>');
     })
