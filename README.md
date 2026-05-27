@@ -28,8 +28,30 @@ A core design choice: **slab returns structured JSON, not pre-digested prose**. 
 
 ## Requirements
 
-- **Node ≥ 18.** Uses native `fetch` + ESM. Runs on macOS, Linux, and Windows. Open a terminal and run `node -v` to check — if it prints a version below 18 or the command isn't found, install from [nodejs.org](https://nodejs.org/).
-- **A Clay API key.** Get one from your workspace settings (see [Authentication](#authentication)).
+Before starting, make sure you have these installed:
+
+**1. git**
+
+Run `git --version` in Terminal. If you see `command not found` or a dialog asking to install developer tools, run:
+
+```bash
+xcode-select --install
+```
+
+Click Install in the dialog that appears and wait for it to finish (~5–10 min) before continuing.
+
+**2. Node.js ≥ 18**
+
+Run `node -v` in Terminal. If you see `command not found` or a version below 18:
+
+- **macOS (recommended):** Download the `.pkg` installer from [nodejs.org](https://nodejs.org/) — click the LTS button, double-click the downloaded file, and follow the prompts. This is standalone and doesn't require Homebrew or Xcode.
+- **macOS with Homebrew:** `brew install node` — only use this if Homebrew is already installed *and* your Xcode Command Line Tools are fully set up (i.e. step 1 above is complete).
+
+After installing, close and reopen Terminal, then confirm with `node -v`.
+
+**3. A Clay API key**
+
+Go to **Settings → Account → API Key** in Clay and copy the key. You'll need it in Step 2 below.
 
 ---
 
@@ -37,11 +59,15 @@ A core design choice: **slab returns structured JSON, not pre-digested prose**. 
 
 ### Step 1 — Clone the repo and install dependencies
 
-Open Terminal and run:
+Run each command separately in Terminal — don't paste them all at once:
 
 ```bash
 git clone https://github.com/gunnerpark-alt/slab-mcp.git
+```
+```bash
 cd slab-mcp
+```
+```bash
 npm install
 ```
 
@@ -57,13 +83,34 @@ In Clay, go to **Settings → Account → API Key** and copy the key. It works a
 
 ### Step 3 — Add slab to Claude Desktop
 
-Open this file in a text editor:
+First, find your exact path by running this in Terminal (from inside the `slab-mcp` folder):
 
-```
-~/Library/Application Support/Claude/claude_desktop_config.json
+```bash
+pwd
 ```
 
-Add the `mcpServers` block. If the file already has other MCP servers, add `"slab"` inside the existing `"mcpServers"` object — don't replace the whole file.
+It will print something like `/Users/yourname/slab-mcp`. Your config path will be that output with `/index.js` appended.
+
+**If the config file doesn't exist yet** (e.g. you just installed Claude Desktop and never opened it, or `open ~/Library/Application\ Support/Claude/claude_desktop_config.json` says the file doesn't exist), create it from scratch. Replace `/Users/yourname/slab-mcp` with your actual `pwd` output:
+
+```bash
+mkdir -p ~/Library/Application\ Support/Claude
+cat > ~/Library/Application\ Support/Claude/claude_desktop_config.json << 'EOF'
+{
+  "mcpServers": {
+    "slab": {
+      "command": "node",
+      "args": ["/Users/yourname/slab-mcp/index.js"],
+      "env": {
+        "CLAY_API_KEY": "paste-your-key-here"
+      }
+    }
+  }
+}
+EOF
+```
+
+**If the file already exists**, open it in a text editor and add the `"slab"` block inside the existing `"mcpServers"` object — don't replace the whole file:
 
 ```json
 {
@@ -79,7 +126,7 @@ Add the `mcpServers` block. If the file already has other MCP servers, add `"sla
 }
 ```
 
-Replace `/Users/yourname/slab-mcp/index.js` with your actual path — open Terminal, `cd` into the cloned folder, run `pwd`, and append `/index.js`. On Windows use a path like `C:\\Users\\yourname\\slab-mcp\\index.js`.
+Either way, replace `paste-your-key-here` with your Clay API key and `/Users/yourname/slab-mcp/index.js` with your actual path.
 
 > Don't put the key in `args` — use `env` so it stays out of shell history and logs.
 
