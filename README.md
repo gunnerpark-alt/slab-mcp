@@ -33,61 +33,37 @@ A core design choice: **slab returns structured JSON, not pre-digested prose**. 
 
 ---
 
-## Installation
+## Setup
+
+### Step 1 — Clone the repo and install dependencies
+
+Open Terminal and run:
 
 ```bash
 git clone https://github.com/gunnerpark-alt/slab-mcp.git
 cd slab-mcp
 npm install
-pwd     # note this path — you'll paste it into your MCP client config below
 ```
 
-That's it for the server. Next step is auth + wiring into your MCP client. Hold onto the `pwd` output — the MCP config wants the absolute path to `index.js` inside this directory (e.g., `/Users/yourname/slab-mcp/index.js`).
+No build step — `npm install` is everything. The server runs directly as `node index.js`. Note the directory path — you'll need it in Step 3.
 
 ---
 
-## Authentication
+### Step 2 — Get your Clay API key
 
-slab reads your Clay API key from one of two places, in order:
-
-1. **`CLAY_API_KEY` environment variable** — recommended for MCP clients (Claude Desktop / Code), set via the server's `env` block (see [Configuration](#configuration)).
-2. **`~/.slab/config.json`** — fallback for users who'd rather not put the key in shell or client config.
-
-### Step 1 — Get your API key
-
-In Clay, go to **Settings → Account → API Key** and copy the key.
-
-It's one universal key per Clay account — assuming admin access, it works across every workspace you belong to. You don't need to generate a separate key per workspace.
-
-### Step 2 — Make the key available to slab
-
-**Option A — via your MCP client config (recommended).** Put the key in the `env` block of the slab server entry (see the [Configuration](#configuration) section below). The key never touches your shell history, the repo, or any file slab creates.
-
-**Option B — `~/.slab/config.json`.** Create the file with mode 600 so only you can read it:
-
-```bash
-mkdir -p ~/.slab
-cat > ~/.slab/config.json <<'EOF'
-{ "apiKey": "<paste-your-key-here>" }
-EOF
-chmod 600 ~/.slab/config.json
-```
-
-This file is outside the repo and is not checked in. Don't put it inside the slab-mcp checkout.
-
-### Don't commit your key
-
-- `~/.slab/config.json` is a per-user file outside the repo — safe by location.
-- `.env`, `.env.*`, and `.claude/` are already in `.gitignore` (the second covers Claude Code's local settings, which is where MCP `env` values live).
-- Never paste the key into a file inside this repo, into a commit message, or into the `args` array of an MCP server config (use `env` instead).
+In Clay, go to **Settings → Account → API Key** and copy the key. It works across every workspace you belong to — you don't need a separate key per workspace.
 
 ---
 
-## Configuration
+### Step 3 — Add slab to Claude Desktop
 
-### Claude Desktop
+Open this file in a text editor:
 
-Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or the equivalent on your OS:
+```
+~/Library/Application Support/Claude/claude_desktop_config.json
+```
+
+Add the `mcpServers` block. If the file already has other MCP servers, add `"slab"` inside the existing `"mcpServers"` object — don't replace the whole file.
 
 ```json
 {
@@ -96,18 +72,36 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) o
       "command": "node",
       "args": ["/Users/yourname/slab-mcp/index.js"],
       "env": {
-        "CLAY_API_KEY": "<paste-your-key-here>"
+        "CLAY_API_KEY": "paste-your-key-here"
       }
     }
   }
 }
 ```
 
-Replace `/Users/yourname/slab-mcp/index.js` with the actual absolute path on your machine — the `pwd` output from the install step plus `/index.js` (for example, `/Users/enisrama/slab-mcp/index.js`). On Windows, use a path like `C:\\Users\\yourname\\slab-mcp\\index.js`.
+Replace `/Users/yourname/slab-mcp/index.js` with your actual path — open Terminal, `cd` into the cloned folder, run `pwd`, and append `/index.js`. On Windows use a path like `C:\\Users\\yourname\\slab-mcp\\index.js`.
 
-Quit and relaunch Claude Desktop. Verify in **Settings → Developer** that `slab` shows as connected.
+> Don't put the key in `args` — use `env` so it stays out of shell history and logs.
 
-### Claude Code
+---
+
+### Step 4 — Restart Claude Desktop
+
+Fully quit the app (**Cmd+Q** on Mac), then reopen it. A simple window close isn't enough — the MCP server only starts on launch.
+
+---
+
+### Step 5 — Verify the connection
+
+In Claude Desktop go to **Settings → Developer**. You should see `slab` listed with a green connected indicator.
+
+**If it shows an error:**
+- Wrong path — run `ls /path/to/slab-mcp/index.js` in Terminal to confirm the file exists at the path you put in the config.
+- Bad API key — make sure you copied the full key with no extra spaces.
+
+---
+
+### Claude Code (alternative client)
 
 Add to `~/.claude.json` (user-level) or a project `.mcp.json`:
 
@@ -118,28 +112,18 @@ Add to `~/.claude.json` (user-level) or a project `.mcp.json`:
       "command": "node",
       "args": ["/Users/yourname/slab-mcp/index.js"],
       "env": {
-        "CLAY_API_KEY": "<paste-your-key-here>"
+        "CLAY_API_KEY": "paste-your-key-here"
       }
     }
   }
 }
 ```
 
-If your project uses `.claude/settings.local.json`, you can put the key there instead — that file is gitignored by Claude Code:
-
-```json
-{
-  "env": {
-    "CLAY_API_KEY": "<paste-your-key-here>"
-  }
-}
-```
-
-Then in Claude Code run `/mcp` and reconnect `slab`.
+Then run `/mcp` in Claude Code and reconnect `slab`.
 
 ### Any other MCP client
 
-slab is a standard stdio MCP server. Anything that speaks MCP can run it. Make sure `CLAY_API_KEY` is in the environment (or that `~/.slab/config.json` exists):
+slab is a standard stdio MCP server — anything that speaks MCP can run it:
 
 ```bash
 CLAY_API_KEY=<your-key> node /Users/yourname/slab-mcp/index.js
