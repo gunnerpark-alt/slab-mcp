@@ -28,8 +28,25 @@ A core design choice: **slab returns structured JSON, not pre-digested prose**. 
 
 ## Requirements
 
-- **Node ≥ 18.** Uses native `fetch` + ESM. Runs on macOS, Linux, and Windows. Open a terminal and run `node -v` to check — if it prints a version below 18 or the command isn't found, install from [nodejs.org](https://nodejs.org/).
-- **A Clay API key.** Get one from your workspace settings (see [Authentication](#authentication)).
+Before starting, make sure you have these installed:
+
+**1. git**
+
+Run `git --version` in Terminal. If you see `command not found` or a dialog asking to install developer tools, run:
+
+```bash
+xcode-select --install
+```
+
+Click Install in the dialog that appears and wait for it to finish (~5–10 min) before continuing.
+
+**2. Node.js ≥ 18**
+
+Run `node -v` in Terminal. If you see `command not found` or a version below 18, download and run the macOS installer from [nodejs.org](https://nodejs.org/) (use the LTS version). After installing, close and reopen Terminal, then confirm with `node -v`.
+
+**3. A Clay API key**
+
+Go to **Settings → Account → API Key** in Clay and copy the key. You'll need it in Step 2 below.
 
 ---
 
@@ -37,11 +54,15 @@ A core design choice: **slab returns structured JSON, not pre-digested prose**. 
 
 ### Step 1 — Clone the repo and install dependencies
 
-Open Terminal and run:
+Run each command separately in Terminal — don't paste them all at once:
 
 ```bash
 git clone https://github.com/gunnerpark-alt/slab-mcp.git
+```
+```bash
 cd slab-mcp
+```
+```bash
 npm install
 ```
 
