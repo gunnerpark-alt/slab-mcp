@@ -16,9 +16,9 @@
  * Design: tools return structured JSON. Interpretation, classification,
  * and prose-shaping happen in prompt context — not on the script side.
  *
- * Builder workflows (writing formulas, writing Claygent prompts) live in
- * skills under skills/ — installable separately into the user's Claude Code
- * skill directory. See README "Installing the skills" for setup.
+ * Builder workflows (writing formulas, writing Claygent prompts) live in the
+ * companion clay-gtm-architect project — the clay-formulas and clay-prompt-eng
+ * skills — not in this MCP server. slab is purely read/debug.
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -601,7 +601,7 @@ These tasks REQUIRE get_record on a real populated row. Don't try to answer them
 
   Optimizing / rewriting / reviewing a Claygent or Use AI prompt
   ──────────────────────────────────────────────────────────────
-  The prompt template tells you what was asked. The nested output tells you what the model actually returned: stepsTaken (research trail — every site visited, every query tried), reasoning, sources cited, confidence, where the answer actually came from. Common findings only visible in nested output: prompts asking for data that's already available upstream from a cheaper column (waste — e.g. a Mapbox geocode already returns "neighborhood: Upper West Side" but a downstream gpt-5 Claygent is paying 3.9 credits to determine the same thing); prompts the model partially ignores (drift between template and behavior); prompts producing different output shapes across rows (contract drift). Fetch get_record on 1-3 representative rows BEFORE proposing any prompt changes. The write-claygent-prompt skill enforces this as a Step 0 gate.
+  The prompt template tells you what was asked. The nested output tells you what the model actually returned: stepsTaken (research trail — every site visited, every query tried), reasoning, sources cited, confidence, where the answer actually came from. Common findings only visible in nested output: prompts asking for data that's already available upstream from a cheaper column (waste — e.g. a Mapbox geocode already returns "neighborhood: Upper West Side" but a downstream gpt-5 Claygent is paying 3.9 credits to determine the same thing); prompts the model partially ignores (drift between template and behavior); prompts producing different output shapes across rows (contract drift). Fetch get_record on 1-3 representative rows BEFORE proposing any prompt changes. The clay-prompt-eng skill (in the companion clay-gtm-architect project) enforces this as a Step 0 gate.
 
   Tracing data flow across one or more tables
   ────────────────────────────────────────────
@@ -642,9 +642,9 @@ Credits:
 
   When a row's full nested JSON would blow the context window (HubSpot/SFDC Lookup columns commonly inflate get_record to 100–300KB), pass slim:true to drop fullContent, or columns=[...] to project to specific fields. Both keep credits/aiProviderCostUsd intact.
 
-== Builder workflows live in skills, not here ==
+== Builder workflows live in the clay-gtm-architect project, not here ==
 
-When the user asks to WRITE, FIX, or REVIEW a Clay formula or a Claygent / Use AI prompt, the workflow lives in an installable skill (write-clay-formula, write-claygent-prompt) — not in this MCP server. Sync the table for context, then defer to the skill's section structure, casing conventions, and validation rules. If the skill isn't installed, the user can find it under skills/ in the slab-mcp repo.`
+When the user asks to WRITE, FIX, or REVIEW a Clay formula or a Claygent / Use AI prompt, the workflow lives in the companion clay-gtm-architect project's skills (clay-formulas, clay-prompt-eng) — not in this MCP server. Sync the table for context, then defer to those skills' section structure, casing conventions, and validation rules. If they aren't installed, the user can find them in the clay-gtm-architect project (github.com/gunnerpark-alt/clay-gtm-architect).`
 });
 
 // ---------------------------------------------------------------------------

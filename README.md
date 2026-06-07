@@ -2,7 +2,7 @@
 
 **MCP server for analyzing Clay tables** — schema, rows, errors, credit cost, and enrichment debugging, via Clay's public v3 API.
 
-Connects Claude (Desktop, Code, or any MCP client) to Clay. Share any `app.clay.com` URL and Claude can read the schema, pull rows, trace enrichment failures end-to-end through Clay Functions (subroutines), and see exactly how many credits each cell consumed. Two installable Claude Code skills (`write-clay-formula`, `write-claygent-prompt`) cover the writing workflows.
+Connects Claude (Desktop, Code, or any MCP client) to Clay. Share any `app.clay.com` URL and Claude can read the schema, pull rows, trace enrichment failures end-to-end through Clay Functions (subroutines), and see exactly how many credits each cell consumed. Writing formulas and Claygent prompts lives in the companion [clay-gtm-architect](https://github.com/gunnerpark-alt/clay-gtm-architect) project — slab reads and debugs, the architect builds.
 
 > slab authenticates with a Clay API key — cross-platform (macOS / Linux / Windows), no Chrome dependency.
 
@@ -14,7 +14,7 @@ Connects Claude (Desktop, Code, or any MCP client) to Clay. Share any `app.clay.
 - **Trace why an enrichment failed** — find a row by name, get the raw provider response, follow each subroutine pointer into the child row that actually ran, recurse up to 3 levels.
 - **See per-row credit cost** — every cell's basic credits, action-execution credits, post-2026 pricing, and underlying OpenAI/Anthropic dollar cost for AI columns. Roll-up total per row.
 - **Spot what's broken across a table** — per-column status counts (success / error / has-not-run / queued), error message frequencies, fill rate.
-- **Write or fix formulas and Claygent prompts** — two installable Claude Code skills (`write-clay-formula`, `write-claygent-prompt`) walk the workflow: gather inputs, pick the mode, apply the section structure and casing conventions, validate against the production-bug checklist.
+- **Reading and debugging, not building** — slab focuses on reading schema and tracing failures. Writing or fixing formulas and Claygent prompts is handled by the companion [clay-gtm-architect](https://github.com/gunnerpark-alt/clay-gtm-architect) project's `clay-formulas` and `clay-prompt-eng` skills, which walk the workflow: gather inputs, pick the mode, apply the section structure and casing conventions, validate against the production-bug checklist.
 
 ---
 
@@ -180,7 +180,7 @@ CLAY_API_KEY=<your-key> node /Users/yourname/slab-mcp/index.js
 
 ## Tools
 
-slab exposes six data tools — what a table IS and what's IN it. Builder workflows (writing formulas, writing Claygent prompts) live in [skills](#skills) instead.
+slab exposes six data tools — what a table IS and what's IN it. Builder workflows (writing formulas, writing Claygent prompts) live in the companion [clay-gtm-architect](https://github.com/gunnerpark-alt/clay-gtm-architect) project instead.
 
 | Tool | Use when | Returns |
 |---|---|---|
@@ -212,7 +212,6 @@ index.js                 MCP server, tool definitions, decision-tree instruction
 src/clay-api.js          Clay v3 API client — endpoint helpers + schema projection
 src/auth.js              Credential resolver (CLAY_API_KEY env → ~/.slab/config.json fallback)
 src/row-utils.js         Status counting, record projection (token-cheap shape)
-skills/                  Installable Claude Code skills — write-clay-formula, write-claygent-prompt
 ```
 
 Four things are worth understanding deeper because they're what makes slab actually useful for "explain this table" / "why did X fail" questions, beyond just listing endpoints:
@@ -283,45 +282,15 @@ The schema cache lives in-process and vanishes when the MCP server restarts.
 
 ## Skills
 
-slab ships two installable Claude Code skills under [`skills/`](skills/). They're separate from the MCP server — the MCP gives Claude *data tools*; the skills give Claude *builder workflows*.
-
-| Skill | Triggers on | What it does |
-|---|---|---|
-| [`write-clay-formula`](skills/write-clay-formula/SKILL.md) | "write / fix / debug / review a Clay formula" | Walks the formula-generation workflow: gather inputs → check sandbox traps → write → validate. Encodes the 10 critical syntax rules (no `return`, no template literals, optional chaining everywhere, lookup `.records` / filter `.filteredArray` wrappers, `Number()` for scoring), 30 worked patterns, and the confirmed production bugs (Object.assign on enrichment objects, Audiences round-trip, waterfall context-change). |
-| [`write-claygent-prompt`](skills/write-claygent-prompt/SKILL.md) | "write / fix / review a Claygent or Use AI prompt" | Picks the mode first — web research (12 mandatory sections, internet access) vs content manipulation (10 sections, no internet). Encodes the section structure, casing conventions (snake_case inputs, camelCase outputs, ALL CAPS filler variables), forbidden-strings list, the empty-string null policy with 3+ reinforcement, anti-hallucination guardrails, and the model + action-key cost ladder. |
+The builder skills that used to live here have moved to the companion [clay-gtm-architect](https://github.com/gunnerpark-alt/clay-gtm-architect) project, where they're now `clay-formulas` (write / fix / review Clay formulas) and `clay-prompt-eng` (write / fix / review Claygent and Use AI prompts), alongside the `clay-architect` skill. Install them from that repo's plugin marketplace — it's the single source of truth, so there's nothing to copy or symlink out of slab anymore.
 
 ### Why skills, not knowledge-base docs
 
-Earlier versions of slab shipped a `kb/` directory with reference markdown for formulas, prompts, providers, debugging, etc. — pulled in via a `read_kb` MCP tool. That's gone. The skills replace it.
+Reference docs let Claude *look things up after it's already chosen what to do*. Skills shape the *order of operations* before any choice is made — a workflow with an embedded constraint set, not a lookup-after-the-fact cookbook. For "write a Clay formula" or "write a Claygent prompt," that ordering is the leverage. Those skills now live in clay-gtm-architect, but the rationale is unchanged.
 
-Reference docs let Claude *look things up after it's already chosen what to do*. Skills shape the *order of operations* before any choice is made — they're a workflow with an embedded constraint set, not a cookbook. For "write a Clay formula" or "write a Claygent prompt," the workflow is the leverage. Reference material that doesn't change the order Claude does things in is mostly bulk Claude already knows from training.
+## Related projects
 
-### Installing the skills
-
-The skills are Claude Code-specific. Claude Desktop and direct API users don't get this scaffolding; they fall back on the MCP server's `instructions` field for tool selection only.
-
-For per-user install:
-
-```bash
-mkdir -p ~/.claude/skills
-cp -r skills/write-clay-formula     ~/.claude/skills/
-cp -r skills/write-claygent-prompt  ~/.claude/skills/
-```
-
-Or symlink so updates from `git pull` propagate without re-copying:
-
-```bash
-ln -s "$(pwd)/skills/write-clay-formula"    ~/.claude/skills/write-clay-formula
-ln -s "$(pwd)/skills/write-claygent-prompt" ~/.claude/skills/write-claygent-prompt
-```
-
-For project-scoped install, drop them under `.claude/skills/` in the project root instead.
-
-Verify with `/skills` in Claude Code.
-
-### Editing the skills
-
-Edit the SKILL.md file directly. Skills are loaded fresh on each invocation — no build step, no MCP reconnect needed. PRs welcome.
+slab is the **sensor**: it reads, traces, and costs live Clay tables through the v3 API. [clay-gtm-architect](https://github.com/gunnerpark-alt/clay-gtm-architect) is the **memory + actuator**: a curated Clay Knowledge Base plus the `clay-architect`, `clay-prompt-eng`, and `clay-formulas` skills that turn briefs into buildable specs and answer best-practice questions. The two close the loop — clay-gtm-architect's `clay-kb-curate` skill reads tables **via this MCP** and proposes Knowledge Base additions from what it finds. Both run together inside the Slack-fronted managed agent.
 
 ---
 
@@ -363,7 +332,7 @@ get_credits(tableId)                  # samples 50 rows, extrapolates
 **"Help me rewrite the Claygent prompt in column X"**
 ```
 sync_table (schema shows current prompt text in full)
-  → write-claygent-prompt skill auto-triggers
+  → clay-prompt-eng skill (clay-gtm-architect) handles the rewrite
   → skill picks mode (web research vs content manipulation)
   → skill walks the 12- or 10-section workflow
   → returns a rewritten prompt with proper casing, null policy, examples
@@ -372,7 +341,7 @@ sync_table (schema shows current prompt text in full)
 **"Fix this formula"**
 ```
 sync_table (schema shows current formula text)
-  → write-clay-formula skill auto-triggers
+  → clay-formulas skill (clay-gtm-architect) handles the fix
   → skill checks sandbox traps, optional-chaining, lookup column wrapping
   → returns a corrected formula with the 10 syntax rules satisfied
 ```
