@@ -6,6 +6,7 @@ const ANTHROPIC_VERSION = '2023-06-01';
 const threadSessions = new Map();
 const seenEventIds = new Set();
 const seenMessages = new Set();
+let cachedBotUserId = null;
 
 export function verifySlackSignature(req, signingSecret) {
   const ts = req.headers['x-slack-request-timestamp'];
@@ -49,6 +50,15 @@ export async function handleSlackEvents(req, res, config) {
   if (body.type !== 'event_callback') return;
   const event = body.event;
   if (!event) return;
+
+  // KB feedback: a 👎 reaction on the agent's own answer → a Notion inbox row.
+  // Self-gates — no-op unless NOTION_TOKEN is configured.
+  if (event.type === 'reaction_added') {
+    if (config.notionToken && config.notionDbId) {
+      handleReactionFeedback(event, config).catch((e) => console.error('reaction feedback failed:', e));
+    }
+    return;
+  }
 
   const isMention = event.type === 'app_mention';
   const isThreadFollowup =
@@ -396,4 +406,175 @@ function anthropicHeaders(key) {
     'anthropic-beta': ANTHROPIC_BETA,
     'content-type': 'application/json',
   };
+}
+
+// ---------------------------------------------------------------------------
+// KB feedback capture
+// A 👎 reaction on one of the agent's own answers becomes a row in the Notion
+// "KB Feedback Inbox" (capture-only — this never edits the KB). Reuses the
+// existing /slack/events webhook, signature check, and event dedup.
+// ---------------------------------------------------------------------------
+
+const NOTION_VERSION = '2022-06-28';
+
+async function slackApiGet(botToken, method, params) {
+  const url = `https://slack.com/api/${method}?${new URLSearchParams(params)}`;
+  const r = await fetch(url, { headers: { Authorization: `Bearer ${botToken}` } });
+  return r.json();
+}
+
+async function getBotUserId(botToken) {
+  if (cachedBotUserId !== null) return cachedBotUserId;
+  try {
+    const r = await fetch('https://slack.com/api/auth.test', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${botToken}` },
+    });
+    const j = await r.json();
+    cachedBotUserId = j.user_id || '';
+  } catch {
+    cachedBotUserId = '';
+  }
+  return cachedBotUserId;
+}
+
+async function resolveUserName(botToken, userId) {
+  if (!userId) return '';
+  try {
+    const j = await slackApiGet(botToken, 'users.info', { user: userId });
+    return j.ok ? (j.user?.real_name || j.user?.name || userId) : userId;
+  } catch {
+    return userId;
+  }
+}
+
+async function getPermalink(botToken, channel, ts) {
+  try {
+    const j = await slackApiGet(botToken, 'chat.getPermalink', { channel, message_ts: ts });
+    return j.ok ? j.permalink : '';
+  } catch {
+    return '';
+  }
+}
+
+function threadTranscript(messages, botUserId) {
+  const lines = [];
+  for (const m of messages || []) {
+    const who = m.user === botUserId || m.bot_id ? 'Agent' : 'User';
+    const text = (m.text || '').replace(/<@[A-Z0-9]+>/g, '').replace(/\s+/g, ' ').trim();
+    if (text) lines.push(`${who}: ${text}`);
+  }
+  return lines.join('\n');
+}
+
+async function handleReactionFeedback(event, config) {
+  const { botToken, feedbackEmojis } = config;
+  if (event.item?.type !== 'message') return;
+  if (!feedbackEmojis.includes(event.reaction)) return; // only the configured "not helpful" emoji(s)
+
+  const channel = event.item.channel;
+  const ts = event.item.ts;
+
+  // The reacted message itself.
+  const hist = await slackApiGet(botToken, 'conversations.history',
+    { channel, latest: ts, inclusive: 'true', limit: '1' });
+  const reacted = hist.messages?.[0];
+  if (!reacted) return;
+
+  // Only flag feedback on the agent's own answers.
+  const botUserId = await getBotUserId(botToken);
+  const isAgentAnswer = reacted.user === botUserId || (!botUserId && !!reacted.bot_id);
+  if (!isAgentAnswer) return;
+
+  // Dedup: one row per reacted message.
+  const sourceId = `${channel}:${ts}`;
+  if (await notionRowExists(config, sourceId)) {
+    await ackFeedback(config, channel, event.user, reacted.thread_ts || ts, 'already');
+    return;
+  }
+
+  // The surrounding thread (question + answer) for context.
+  const root = reacted.thread_ts || ts;
+  const repl = await slackApiGet(botToken, 'conversations.replies', { channel, ts: root, limit: '50' });
+  const thread = repl.ok && repl.messages?.length ? repl.messages : [reacted];
+
+  const [permalink, reactor] = await Promise.all([
+    getPermalink(botToken, channel, ts),
+    resolveUserName(botToken, event.user),
+  ]);
+
+  const userMsgs = thread.filter((m) => m.user && m.user !== botUserId && !m.bot_id && m.text);
+  const question = userMsgs.length
+    ? userMsgs[userMsgs.length - 1].text.replace(/<@[A-Z0-9]+>/g, '').trim()
+    : '';
+  const summary = `👎 ${truncate(question || 'Agent answer flagged not helpful', 90)}`;
+
+  await createNotionFeedbackRow(config, {
+    summary,
+    context: `A 👎 reaction flagged this agent answer as not helpful.\n\nThread:\n${threadTranscript(thread, botUserId)}`,
+    sourceUrl: permalink,
+    submittedBy: reactor,
+    sourceId,
+  });
+
+  await ackFeedback(config, channel, event.user, root, 'ok');
+}
+
+async function ackFeedback(config, channel, user, thread_ts, kind) {
+  const text = kind === 'already'
+    ? ':white_check_mark: Already flagged for KB review — thanks!'
+    : ':memo: Flagged for KB review — thanks for the signal!';
+  try {
+    await fetch('https://slack.com/api/chat.postEphemeral', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.botToken}` },
+      body: JSON.stringify({ channel, user, thread_ts, text }),
+    });
+  } catch (e) {
+    console.error('feedback ack failed:', e);
+  }
+}
+
+function notionHeaders(token) {
+  return {
+    Authorization: `Bearer ${token}`,
+    'Notion-Version': NOTION_VERSION,
+    'Content-Type': 'application/json',
+  };
+}
+
+async function notionRowExists(config, sourceId) {
+  try {
+    const r = await fetch(`https://api.notion.com/v1/databases/${config.notionDbId}/query`, {
+      method: 'POST',
+      headers: notionHeaders(config.notionToken),
+      body: JSON.stringify({
+        filter: { property: 'Source ID', rich_text: { equals: sourceId } },
+        page_size: 1,
+      }),
+    });
+    const j = await r.json();
+    return Array.isArray(j.results) && j.results.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+async function createNotionFeedbackRow(config, row) {
+  const properties = {
+    'Summary': { title: [{ text: { content: truncate(row.summary, 200) } }] },
+    'Status': { select: { name: 'New' } },
+    'Source': { select: { name: 'Slack feedback' } },
+    'Type': { select: { name: 'Negative feedback' } },
+    'Problem / context': { rich_text: [{ text: { content: truncate(row.context, 1900) } }] },
+    'Submitted by': { rich_text: [{ text: { content: truncate(row.submittedBy || '', 100) } }] },
+    'Source ID': { rich_text: [{ text: { content: row.sourceId } }] },
+  };
+  if (row.sourceUrl) properties['Source URL'] = { url: row.sourceUrl };
+  const r = await fetch('https://api.notion.com/v1/pages', {
+    method: 'POST',
+    headers: notionHeaders(config.notionToken),
+    body: JSON.stringify({ parent: { database_id: config.notionDbId }, properties }),
+  });
+  if (!r.ok) console.error('Notion feedback row create failed:', r.status, await r.text());
 }

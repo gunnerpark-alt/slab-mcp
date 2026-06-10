@@ -1858,6 +1858,12 @@ if (transportMode === 'http') {
     agentId: process.env.MANAGED_AGENT_ID || '',
     environmentId: process.env.MANAGED_ENVIRONMENT_ID || '',
     vaultId: process.env.MANAGED_VAULT_ID || '',
+    // KB feedback capture (reaction_added → Notion inbox). Self-gates: the
+    // reaction handler is a no-op unless notionToken is set.
+    notionToken: process.env.NOTION_TOKEN || '',
+    notionDbId: process.env.NOTION_FEEDBACK_DB_ID || 'a9c52f22474b47f2b26cb5cd805e6fb3',
+    feedbackEmojis: (process.env.KB_FEEDBACK_EMOJIS || '-1,thumbsdown')
+      .split(',').map((s) => s.trim()).filter(Boolean),
   };
   app.post('/slack/events', (req, res) => {
     const missing = ['signingSecret', 'botToken', 'anthropicKey', 'agentId', 'environmentId']
