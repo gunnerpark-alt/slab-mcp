@@ -11,6 +11,7 @@ Connects Claude (Desktop, Code, or any MCP client) to Clay. Share any `app.clay.
 ## What you get
 
 - **Read any Clay table or workbook** — schema, formulas (full text, no truncation), run conditions, providers, dependencies, recursive function calls.
+- **Pull the whole table in one call, or check a list against it** — export every row's display values for full-dataset analysis (no per-row fetching), or pass a list of IDs / emails / domains and get back exactly which rows match.
 - **Trace why an enrichment failed** — find a row by name, get the raw provider response, follow each subroutine pointer into the child row that actually ran, recurse up to 3 levels.
 - **See per-row credit cost** — every cell's basic credits, action-execution credits, post-2026 pricing, and underlying OpenAI/Anthropic dollar cost for AI columns. Roll-up total per row.
 - **Spot what's broken across a table** — per-column status counts (success / error / has-not-run / queued), error message frequencies, fill rate.
@@ -180,13 +181,15 @@ CLAY_API_KEY=<your-key> node /Users/yourname/slab-mcp/index.js
 
 ## Tools
 
-slab exposes six data tools — what a table IS and what's IN it. Builder workflows (writing formulas, writing Claygent prompts) live in the companion [clay-gtm-architect](https://github.com/gunnerpark-alt/clay-gtm-architect) project instead.
+slab exposes eight data tools — what a table IS and what's IN it. Builder workflows (writing formulas, writing Claygent prompts) live in the companion [clay-gtm-architect](https://github.com/gunnerpark-alt/clay-gtm-architect) project instead.
 
 | Tool | Use when | Returns |
 |---|---|---|
 | `sync_table` | URL contains `/tables/` (not `/workbooks/`) | `{ rootSchema, subroutines }`. Schema includes every field's full `typeSettings` (formula text, prompts, run conditions, full inputsBinding) and `pricing` on action fields (basic credits, actionExecution, pre/post-2026 pricing). Recursively syncs invoked functions to depth 3, max 20 tables. |
 | `sync_workbook` | URL contains `/workbooks/` | `{ workbookId, tables, externalSubroutines, errors }`. Every table in the workbook plus any function it calls that lives elsewhere. Cross-table connections are not pre-computed — derive from `typeSettings`. |
 | `get_rows` | Show data, check fill rates, find a row's `_rowId` by query, look up an entity by name / domain / email, switch to a saved view without re-syncing | `{ totalRows, returnedCount, view, rows }`. Every row carries `_rowId`. Accepts either `tableId` (from a prior sync_table) or `url` (auto-syncs). With `query`, rows also have `matchedColumns` (every column whose cell matched); pass `identifier_column` to scope the search to one column. Pass `view` (viewId `gv_*` or view name like "All rows" / "Errored rows") to query a different saved view than the one picked at sync time. |
+| `export_csv` | You need all (or most) rows for analysis and display values are enough — full-table scans, coverage analysis, summarising patterns across the dataset | `{ totalRows, returnedCount, truncated, view, columns, rows }`. Kicks off a Clay export job, polls until done, downloads once — one round-trip regardless of table size, no row cap. Pass `columns` to project down to just the columns you need (the only way wide/large tables fit the ~900KB response budget); `truncated` + a warning flag when rows were cut. Accepts `view` like get_rows. Not for membership checks — that's find_rows. |
+| `find_rows` | You have a list of IDs / emails / domains and need to know which ones exist in a column — membership checks that would blow the response budget as a full export | `{ column, searched, uniqueSearched, matchedCount, notFoundCount, totalRowsScanned, matches: [{ value, _rowId, ...return_columns }], not_found }`. Fetches rows inside the server and intersects there — raw table data never crosses the MCP transport, so table size can't blow the budget. Matching is exact + case-sensitive against one column; `return_columns` adds context fields to each match; every match carries `_rowId` for follow-up get_record. Scans up to the records-API cap (20000 rows). |
 | `get_record` | You have a `_rowId` and need raw provider JSON, credit cost, or you're following a subroutine `origin` pointer | `{ _rowId, _credits, <columnName>: { value, status, fullContent, credits? } }`. |
 | `get_credits` | "How much did row X cost" / "average credit cost per row" / "which column is most expensive" | One tool, three modes. With `rowId`: that row's per-column breakdown, **including the cost of any function (execute-subroutine) calls it triggered** — recursively follows `origin` pointers to function rows since parent cells don't carry subroutine cost. Without `rowId`: samples N rows (default 50), aggregates, splits direct columns from subroutine columns, and extrapolates a total table cost. Pass `full: true` to scan every row, or `subroutine_depth: 0` to skip recursion (parent-only cost, will undercount). |
 | `get_errors` | Broad "what's failing" / health check | `{ rowsAnalyzed, view, columns: [{ success, error, hasNotRun, queued, total, fillPct, topErrors }] }`. Counts only — Claude derives "broken" vs "gated by run condition" from the schema. Pass `view="Errored rows"` (or any saved view) to scope the count; on a table with that view, this is much faster than counting across the whole table. |
@@ -226,7 +229,7 @@ The result: one call brings back the entire call graph the parent table particip
 
 ### 2. Row lookup splits by mode: server-side search for queries, paginated read for samples
 
-`get_rows` has two paths, both backed by Clay's internal records API — no CSV machinery, no session caching.
+`get_rows` has two paths, both backed by Clay's internal records API — no CSV export jobs involved (that's `export_csv`, below), no session caching.
 
 **With a query — server-side search.** Slab posts to Clay's internal `POST /tables/{tableId}/views/{viewId}/search` endpoint with `{ searchTerm }`. Clay runs the same case-insensitive substring match its own UI search box uses, returning `{ results: [{ fieldId, recordId }] }` — one entry per matching cell, so the same record can repeat across columns. Slab dedupes by `recordId`, builds a `matchedColumns` list per match, then fetches each unique record in parallel (concurrency 5) to populate display values. One round-trip plus N record fetches, no row-count ceiling. Server caps at 1000 matching cells per response — broad substrings like `"@"` or a common domain may saturate it; slab surfaces a `hitCapWarning` when that happens.
 
@@ -237,6 +240,8 @@ This replaced an earlier paginate-the-whole-CSV approach that on a 100k-row tabl
 The records endpoint is also what powers `get_errors` and `get_credits` aggregate mode via `listRows`, which fetches up to `RECORDS_API_CAP` (20000) rows in one shot — the records API silently ignores every pagination param we tested (`offset`, `cursor`, `after`, `page`, ...). `get_errors` flags `truncated` in its response when the view exceeds the cap so partial counts aren't read as full coverage.
 
 A search like `"acme"` will often hit multiple columns simultaneously — Name, URL, parent company. Each match's `matchedColumns` list is what Claude uses to pick the right hit. There's no script-side priority hierarchy.
+
+**Bulk reads get two dedicated tools on top of these primitives.** `export_csv` bypasses the records API entirely: it kicks off Clay's async export job, polls until the file is ready, and downloads the result once — one round-trip regardless of table size, no row cap. The parsed result is truncated to fit the MCP response budget (~900KB) with a `truncated` flag and warning when rows were dropped, which is why its `columns` projection parameter matters on wide tables. `find_rows` goes the other way: it pulls rows via the records API (same 20k cap) but does the set intersection inside the server process, so only matches and misses cross the MCP transport — a membership check against a list of values costs the same whether the table has 50 rows or 20,000.
 
 ### 3. Record tracing follows subroutine pointers down through execution
 
@@ -299,6 +304,21 @@ slab is the **sensor**: it reads, traces, and costs live Clay tables through the
 **"Sync this workbook and tell me what it does"**
 ```
 sync_workbook → Claude reads every table's schema + cross-table connections → explains
+```
+
+**"Summarize the domains / analyze patterns across the whole table"**
+```
+export_csv(url, columns=["Company Name", "Domain"])
+  → every row's display values arrive in one call (async export job, no row cap)
+  → Claude reasons over the full dataset — no per-row fetching
+```
+
+**"Which of these 200 account IDs are already in the table?"**
+```
+find_rows(url, column="Account ID", values=[...])
+  → { matches: [{ value, _rowId, ... }], not_found: [...] }
+  → intersection happens in the server — table size can't blow the response budget
+  → optional: get_record on interesting matches via their _rowId
 ```
 
 **"Why did this enrichment fail for Acme Corp?"**
