@@ -28,3 +28,9 @@ services:
         sync: false
       - key: MANAGED_VAULT_ID
         sync: false
+      # KB feedback capture (reaction_added → Notion inbox). NOTION_TOKEN is the
+      # same integration token the parse-job GitHub Action uses.
+      - key: NOTION_TOKEN
+        sync: false
+      - key: NOTION_FEEDBACK_DB_ID
+        value: a9c52f22474b47f2b26cb5cd805e6fb3
