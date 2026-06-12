@@ -54,8 +54,9 @@ export async function handleSlackEvents(req, res, config) {
   // KB feedback: a 👎 reaction on the agent's own answer → a Notion inbox row.
   // Self-gates — no-op unless NOTION_TOKEN is configured.
   if (event.type === 'reaction_added') {
+    console.error('[kb-feedback] reaction_added:', event.reaction, 'item=', event.item?.type, event.item?.ts, 'notionToken?', !!config.notionToken);
     if (config.notionToken && config.notionDbId) {
-      handleReactionFeedback(event, config).catch((e) => console.error('reaction feedback failed:', e));
+      handleReactionFeedback(event, config).catch((e) => console.error('[kb-feedback] handler error:', e));
     }
     return;
   }
@@ -470,33 +471,43 @@ function threadTranscript(messages, botUserId) {
 async function handleReactionFeedback(event, config) {
   const { botToken, feedbackEmojis } = config;
   if (event.item?.type !== 'message') return;
-  if (!feedbackEmojis.includes(event.reaction)) return; // only the configured "not helpful" emoji(s)
+  if (!feedbackEmojis.includes(event.reaction)) {
+    console.error('[kb-feedback] emoji not in feedback set:', event.reaction);
+    return;
+  }
 
   const channel = event.item.channel;
   const ts = event.item.ts;
 
-  // The reacted message itself.
-  const hist = await slackApiGet(botToken, 'conversations.history',
-    { channel, latest: ts, inclusive: 'true', limit: '1' });
-  const reacted = hist.messages?.[0];
-  if (!reacted) return;
+  // Fetch the reacted message + its thread. The bot posts its answers as THREAD REPLIES,
+  // which conversations.history does NOT return — so use conversations.replies, which accepts
+  // either a thread parent or an in-thread reply ts. (Using history here was the original
+  // silent-fail bug: it never found the bot's reply, so every reaction bailed.)
+  const repl = await slackApiGet(botToken, 'conversations.replies', { channel, ts, limit: '100' });
+  const thread = (repl.messages && repl.messages.length) ? repl.messages : [];
+  const reacted = thread.find((m) => m.ts === ts);
+  if (!reacted) {
+    console.error('[kb-feedback] reacted message not found', `${channel}:${ts}`, 'repl.ok=', repl.ok, repl.error || '');
+    return;
+  }
 
   // Only flag feedback on the agent's own answers.
   const botUserId = await getBotUserId(botToken);
   const isAgentAnswer = reacted.user === botUserId || (!botUserId && !!reacted.bot_id);
-  if (!isAgentAnswer) return;
+  if (!isAgentAnswer) {
+    console.error('[kb-feedback] ignored — not an agent message; reacted.user=', reacted.user, 'botUserId=', botUserId, 'bot_id=', reacted.bot_id);
+    return;
+  }
+
+  const root = reacted.thread_ts || ts;
 
   // Dedup: one row per reacted message.
   const sourceId = `${channel}:${ts}`;
   if (await notionRowExists(config, sourceId)) {
-    await ackFeedback(config, channel, event.user, reacted.thread_ts || ts, 'already');
+    await ackFeedback(config, channel, event.user, root, 'already');
     return;
   }
-
-  // The surrounding thread (question + answer) for context.
-  const root = reacted.thread_ts || ts;
-  const repl = await slackApiGet(botToken, 'conversations.replies', { channel, ts: root, limit: '50' });
-  const thread = repl.ok && repl.messages?.length ? repl.messages : [reacted];
+  console.error('[kb-feedback] writing Notion row for', `${channel}:${ts}`);
 
   const [permalink, reactor] = await Promise.all([
     getPermalink(botToken, channel, ts),
