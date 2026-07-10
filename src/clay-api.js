@@ -233,6 +233,57 @@ export async function fetchCsv(downloadUrl) {
   return res.text();
 }
 
+// ---------------------------------------------------------------------------
+// Terracotta (Clay Workflows) — read surface.
+//
+// Same internal /v3 API, same key. The KEY DIFFERENCE from table endpoints:
+// workflow endpoints are workspace-scoped in the PATH (/workspaces/<ws>/...),
+// so the workspaceId must be parsed out of the Terracotta URL and threaded
+// through. A broad internal key reads workflows across any workspace it can
+// see — table IDs are globally unique, but workflow routes are not.
+// ---------------------------------------------------------------------------
+
+/**
+ * List workflows in a workspace. Returns [{ id, name, lastRunAt, ... }].
+ */
+export async function listWorkflows(workspaceId) {
+  const data = await clayRequest(`/workspaces/${workspaceId}/tc-workflows`);
+  return data.workflows || [];
+}
+
+/**
+ * Fetch a single workflow's metadata (id, name, lastRunAt, creator, url).
+ */
+export async function getWorkflowMeta(workspaceId, workflowId) {
+  const data = await clayRequest(`/workspaces/${workspaceId}/tc-workflows/${workflowId}`);
+  return data.workflow || data;
+}
+
+/**
+ * Fetch a workflow's full graph: { nodes, edges, validation,
+ * workflowInputSchema, recommendedManualSchema }. This is the raw structure
+ * the Clay Workflows editor renders — projection happens in the tool layer.
+ */
+export async function getWorkflowGraph(workspaceId, workflowId) {
+  return clayRequest(`/workspaces/${workspaceId}/tc-workflows/${workflowId}/graph`);
+}
+
+/**
+ * List a workflow's runs (most recent first). Cursor-paginated.
+ * Returns { runs, nextCursor }. Each run carries runStatus, credit usage,
+ * and trigger info.
+ */
+export async function getWorkflowRuns(workspaceId, workflowId, { limit, cursor } = {}) {
+  const params = new URLSearchParams();
+  if (limit) params.set('limit', String(limit));
+  if (cursor) params.set('cursor', cursor);
+  const qs = params.toString();
+  const data = await clayRequest(
+    `/workspaces/${workspaceId}/tc-workflows/${workflowId}/runs${qs ? `?${qs}` : ''}`
+  );
+  return { runs: data.runs || [], nextCursor: data.nextCursor || null };
+}
+
 /**
  * List all tables in a workbook.
  */

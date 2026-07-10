@@ -13,6 +13,11 @@
  *   get_credits    — Credit cost for one row or aggregated across the table
  *   get_errors     — Per-column status counts (success / error / has-not-run / queued)
  *
+ * Terracotta (Clay Workflows) tools — workspace-scoped, read across workspaces:
+ *   list_workflows    — Discover workflows in a workspace (id, name, lastRunAt)
+ *   get_workflow      — A workflow's node graph, edges, flow, validation, input schema
+ *   get_workflow_runs — A workflow's run history (status, credits, trigger, timing)
+ *
  * Design: tools return structured JSON. Interpretation, classification,
  * and prose-shaping happen in prompt context — not on the script side.
  *
@@ -26,7 +31,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 
-import { getTableSchema, listRows, getRecord, getWorkbookTables, getAllRecords, searchRecords, exportTableToCsv, fetchCsv, RECORDS_API_CAP } from './src/clay-api.js';
+import { getTableSchema, listRows, getRecord, getWorkbookTables, getAllRecords, searchRecords, exportTableToCsv, fetchCsv, RECORDS_API_CAP, listWorkflows, getWorkflowMeta, getWorkflowGraph, getWorkflowRuns } from './src/clay-api.js';
 import { analyzeRowStatuses, formatRecord } from './src/row-utils.js';
 import { handleSlackEvents } from './src/slack.js';
 
@@ -49,13 +54,20 @@ const MCP_RESPONSE_MAX_BYTES = 900_000;
 
 function parseClayUrl(url) {
   if (!url) throw new Error('No URL provided. Pass a Clay table or workbook URL.');
-  const workbookMatch = url.match(/workbooks\/(wb_[a-zA-Z0-9]+)/);
-  const tableMatch    = url.match(/tables\/(t_[a-zA-Z0-9]+)/);
-  const viewMatch     = url.match(/views\/(gv_[a-zA-Z0-9]+)/);
+  const workbookMatch  = url.match(/workbooks\/(wb_[a-zA-Z0-9]+)/);
+  const tableMatch     = url.match(/tables\/(t_[a-zA-Z0-9]+)/);
+  const viewMatch      = url.match(/views\/(gv_[a-zA-Z0-9]+)/);
+  // Terracotta (Workflows) URLs: app.clay.com/workspaces/<ws>/terracotta/tc-workflows/<wf>
+  // Unlike table IDs, workflow routes are workspace-scoped, so the numeric
+  // workspace segment matters here and must be captured.
+  const workspaceMatch = url.match(/workspaces\/(\d+)/);
+  const workflowMatch  = url.match(/tc-workflows\/(wf_[a-zA-Z0-9]+)/);
   return {
-    workbookId: workbookMatch?.[1] || null,
-    tableId:    tableMatch?.[1]    || null,
-    viewId:     viewMatch?.[1]     || null
+    workbookId:  workbookMatch?.[1]  || null,
+    tableId:     tableMatch?.[1]     || null,
+    viewId:      viewMatch?.[1]      || null,
+    workspaceId: workspaceMatch?.[1] || null,
+    workflowId:  workflowMatch?.[1]  || null
   };
 }
 
@@ -100,6 +112,70 @@ function detectSubroutineCalls(schema) {
     }
   }
   return calls;
+}
+
+/**
+ * Project a raw Terracotta workflow graph down to a readable summary.
+ * Default keeps it small (structure + flow); `code:true` includes the actual
+ * script/prompt bodies that carry the logic. Mirrors Slab's project-by-default
+ * philosophy — the 57KB+ raw graph is available via raw:true on the tool.
+ */
+function projectWorkflowGraph(graph, { code = false } = {}) {
+  const nodes = graph.nodes || [];
+  const edges = graph.edges || [];
+  const nameById = {};
+  for (const n of nodes) nameById[n.id] = n.name;
+
+  const projectedNodes = nodes.map(n => {
+    const out = { id: n.id, name: n.name, nodeType: n.nodeType };
+    if (n.description) out.description = n.description;
+
+    // Tool nodes: which Clay action(s) they run.
+    if (Array.isArray(n.tools) && n.tools.length) {
+      out.actions = n.tools.map(t => ({
+        name:      t.name || null,
+        actionKey: t.config?.actionKey || t.actionKey || null
+      }));
+    }
+
+    // What this node consumes from upstream nodes.
+    const inputRefs = n.nodeConfig?.inputRefs;
+    if (inputRefs && typeof inputRefs === 'object') {
+      out.inputs = Object.entries(inputRefs).map(([k, ref]) => ({
+        name: k,
+        from: ref?.sourceNodeId ? (nameById[ref.sourceNodeId] || ref.sourceNodeId) : null,
+        path: ref?.path || null
+      }));
+    }
+
+    // Agent (Claygent) reference.
+    if (n.claygentId) out.claygentId = n.claygentId;
+
+    // Code / conditional bodies.
+    const scriptVersion = n.currentScriptVersion;
+    if (scriptVersion?.code) {
+      out.language = scriptVersion.language || null;
+      out.codeChars = scriptVersion.code.length;
+      if (code) out.code = scriptVersion.code;
+    }
+
+    return out;
+  });
+
+  // Resolve edges into a human-readable flow ("Source → Target").
+  const flow = edges.map(e => ({
+    from: nameById[e.sourceNodeId] || e.sourceNodeId,
+    to:   nameById[e.targetNodeId] || e.targetNodeId
+  }));
+
+  return {
+    validation:         graph.validation || null,
+    workflowInputSchema: graph.workflowInputSchema || null,
+    nodeCount:          nodes.length,
+    edgeCount:          edges.length,
+    nodes:              projectedNodes,
+    flow
+  };
 }
 
 /**
@@ -538,7 +614,7 @@ function parseCsv(text) {
 function createServer() {
 const server = new McpServer({
   name: 'slab',
-  version: '4.8.0'
+  version: '4.9.0'
 }, {
   instructions: `Slab is the ONLY way to access Clay table and workbook data. When the user shares any URL containing clay.com, use Slab — do NOT web-fetch, scrape, or use other MCPs. Auth is automatic.
 
@@ -641,6 +717,18 @@ Credits:
   Aggregate mode is the important one. It samples sampleSize rows for cost rollup but ALSO fetches the full row population (capped at 20K) for table-wide fill statistics, and reconciles the sample-based per-row averages against the fill rates. The output has both sample-mean and reconciled fields — ALWAYS prefer perRow.reconciled.avg over perRow.avg when present. Clay's /records endpoint biases sampling toward "active" rows, so a 50-row sample can show a column firing on 90% of rows even when the table-wide rate is 40%. The reconciled fields use per-billed-cell cost from the sample × success_count / rowsScanned (from get_errors-equivalent fill data), which corrects for that bias. samplingBiasHint fires when the sample mean diverges from reconciled by more than 30%.
 
   When a row's full nested JSON would blow the context window (HubSpot/SFDC Lookup columns commonly inflate get_record to 100–300KB), pass slim:true to drop fullContent, or columns=[...] to project to specific fields. Both keep credits/aiProviderCostUsd intact.
+
+== Terracotta / Clay Workflows (read-only) ==
+
+Slab also reads Clay Workflows (Terracotta) — the multi-node automations, separate from tables. These endpoints are WORKSPACE-SCOPED: they need the numeric workspace ID from the URL (app.clay.com/workspaces/<ws>/terracotta/tc-workflows/<wf>), unlike table IDs which are global. The configured key spans every workspace it can see, so this works across customer workspaces.
+
+  Discover workflows in a workspace                → list_workflows (workspaceId or any /workspaces/<id>/ url)
+  Read what a workflow does (structure + flow)     → get_workflow (projected: nodes, actions, flow, validation, trigger input schema)
+  Read the actual node logic (script/prompt code)  → get_workflow with code:true
+  Full untouched graph JSON                         → get_workflow with raw:true
+  Run history (status, credits, trigger, timing)   → get_workflow_runs (cursor-paginated)
+
+get_workflow projects by default (like the table tools): node bodies are omitted, only codeChars sizes are shown, until you pass code:true. Node types: trigger, code (Python), conditional (branching), tool (one Clay action — see actionKey), agent (Claygent/LLM; prompt body is referenced by claygentId, not inlined). flow is the edge list resolved to node names (from → to). To compare flow logic across customers, call get_workflow per workspace and diff the projected structure.
 
 == Builder workflows live in the clay-gtm-architect project, not here ==
 
@@ -1813,6 +1901,181 @@ INTERPRETATION: a column with success=0 and error>0 is broken UNLESS its top err
       };
     } catch (err) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: `Error analyzing errors: ${err.message}` }) }], isError: true };
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: list_workflows  (Terracotta / Clay Workflows)
+// ---------------------------------------------------------------------------
+
+server.tool(
+  'list_workflows',
+  `List Terracotta (Clay Workflows) in a workspace. Use this to discover workflow IDs before calling get_workflow / get_workflow_runs.
+
+ACCEPTS EITHER workspaceId (numeric, e.g. 461075) OR url (any Clay URL containing /workspaces/<id>/...). One is required.
+
+Unlike Clay tables, workflow routes are workspace-scoped — the numeric workspace ID matters. This works across every workspace the configured Clay key can see (a broad internal key spans customer workspaces).
+
+RETURNS: JSON — { workspaceId, count, workflows: [{ id, name, lastRunAt, createdAt, updatedAt, creatorUserId }] }.`,
+  {
+    workspaceId: z.string().optional().describe('Numeric workspace ID (e.g. "461075"). Either workspaceId or url is required.'),
+    url:         z.string().optional().describe('Any Clay URL containing /workspaces/<id>/. Either workspaceId or url is required.')
+  },
+  async ({ workspaceId, url }) => {
+    try {
+      if (!workspaceId && url) workspaceId = parseClayUrl(url).workspaceId;
+      if (!workspaceId) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'Either workspaceId or a url containing /workspaces/<id>/ is required.' }) }], isError: true };
+      }
+      const workflows = await listWorkflows(workspaceId);
+      return {
+        content: [{ type: 'text', text: JSON.stringify({
+          workspaceId,
+          count: workflows.length,
+          workflows: workflows.map(w => ({
+            id:            w.id,
+            name:          w.name,
+            lastRunAt:     w.lastRunAt ?? null,
+            createdAt:     w.createdAt ?? null,
+            updatedAt:     w.updatedAt ?? null,
+            creatorUserId: w.creatorUserId ?? null
+          }))
+        }, null, 2) }]
+      };
+    } catch (err) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: `Error listing workflows: ${err.message}` }) }], isError: true };
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: get_workflow  (Terracotta / Clay Workflows)
+// ---------------------------------------------------------------------------
+
+server.tool(
+  'get_workflow',
+  `Fetch a Terracotta (Clay Workflow) definition — its node graph, edges, validation, and trigger input schema.
+
+ACCEPTS EITHER (workspaceId + workflowId) OR a Terracotta url (app.clay.com/workspaces/<ws>/terracotta/tc-workflows/<wf>). If you pass a url, both IDs are parsed from it.
+
+OUTPUT SHAPE (project-by-default, like the table tools):
+  - Default: structural summary — every node (id, name, nodeType, actions/actionKeys, inputs it consumes, code size) plus the resolved flow (source → target by name), validation, and the workflow's trigger input schema. Code/prompt bodies are omitted but their size is reported as codeChars.
+  - code:true — include the actual script bodies of code/conditional nodes (this is where the logic lives; larger response).
+  - raw:true  — return the entire untouched graph JSON (nodes, edges, validation, schemas). Can be 50KB+.
+
+USE WHEN: reading what a workflow does, comparing flow logic across customer workspaces, auditing node structure. For run history use get_workflow_runs.
+
+NODE TYPES: trigger, code (Python script), conditional (branching script), tool (runs one Clay action), agent (Claygent/LLM node). Agent prompt bodies are referenced by claygentId and not inlined in the graph.`,
+  {
+    workspaceId: z.string().optional().describe('Numeric workspace ID. Required unless url is given.'),
+    workflowId:  z.string().optional().describe('Workflow ID (wf_...). Required unless url is given.'),
+    url:         z.string().optional().describe('Terracotta workflow URL (contains /workspaces/<ws>/ and /tc-workflows/<wf>).'),
+    code:        z.boolean().optional().default(false).describe('Include script/prompt bodies of code & conditional nodes. Default false (only sizes reported).'),
+    raw:         z.boolean().optional().default(false).describe('Return the entire untouched graph JSON. Default false (projected summary).')
+  },
+  async ({ workspaceId, workflowId, url, code, raw }) => {
+    try {
+      if (url) {
+        const parsed = parseClayUrl(url);
+        workspaceId = workspaceId || parsed.workspaceId;
+        workflowId  = workflowId  || parsed.workflowId;
+      }
+      if (!workspaceId || !workflowId) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'Need both workspaceId and workflowId (or a Terracotta url containing both).' }) }], isError: true };
+      }
+
+      const [meta, graph] = await Promise.all([
+        getWorkflowMeta(workspaceId, workflowId).catch(() => null),
+        getWorkflowGraph(workspaceId, workflowId)
+      ]);
+
+      if (raw) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({
+            workspaceId, workflowId,
+            name: meta?.name ?? null,
+            lastRunAt: meta?.lastRunAt ?? null,
+            graph
+          }, null, 2) }]
+        };
+      }
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify({
+          workspaceId,
+          workflowId,
+          name:      meta?.name ?? null,
+          lastRunAt: meta?.lastRunAt ?? null,
+          createdAt: meta?.createdAt ?? null,
+          ...projectWorkflowGraph(graph, { code })
+        }, null, 2) }]
+      };
+    } catch (err) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: `Error fetching workflow: ${err.message}` }) }], isError: true };
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: get_workflow_runs  (Terracotta / Clay Workflows)
+// ---------------------------------------------------------------------------
+
+server.tool(
+  'get_workflow_runs',
+  `List a Terracotta workflow's runs (most recent first) — status, credit usage, trigger, and timing.
+
+ACCEPTS EITHER (workspaceId + workflowId) OR a Terracotta url. Cursor-paginated: pass the returned nextCursor to page further.
+
+RETURNS: JSON — { workspaceId, workflowId, returnedCount, statusCounts, nextCursor, runs: [{ id, runStatus, dataCreditsUsed, actionCreditsUsed, triggerType, createdAt, updatedAt }] }. runStatus is typically "completed" or "failed".
+
+This is a summary surface (run list). Full per-node execution detail for a single run is not yet exposed here — say so if the user needs it.`,
+  {
+    workspaceId: z.string().optional().describe('Numeric workspace ID. Required unless url is given.'),
+    workflowId:  z.string().optional().describe('Workflow ID (wf_...). Required unless url is given.'),
+    url:         z.string().optional().describe('Terracotta workflow URL (contains /workspaces/<ws>/ and /tc-workflows/<wf>).'),
+    limit:       z.number().optional().describe('Max runs to return. Default: server default (~50).'),
+    cursor:      z.string().optional().describe('Pagination cursor from a previous call\'s nextCursor.')
+  },
+  async ({ workspaceId, workflowId, url, limit, cursor }) => {
+    try {
+      if (url) {
+        const parsed = parseClayUrl(url);
+        workspaceId = workspaceId || parsed.workspaceId;
+        workflowId  = workflowId  || parsed.workflowId;
+      }
+      if (!workspaceId || !workflowId) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'Need both workspaceId and workflowId (or a Terracotta url containing both).' }) }], isError: true };
+      }
+
+      const { runs, nextCursor } = await getWorkflowRuns(workspaceId, workflowId, { limit, cursor });
+
+      const statusCounts = {};
+      for (const r of runs) {
+        const s = r.runStatus || 'unknown';
+        statusCounts[s] = (statusCounts[s] || 0) + 1;
+      }
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify({
+          workspaceId,
+          workflowId,
+          returnedCount: runs.length,
+          statusCounts,
+          nextCursor,
+          runs: runs.map(r => ({
+            id:                r.id,
+            runStatus:         r.runStatus ?? null,
+            dataCreditsUsed:   r.dataCreditsUsed ?? null,
+            actionCreditsUsed: r.actionCreditsUsed ?? null,
+            triggerType:       r.trigger?.triggerType ?? null,
+            createdAt:         r.createdAt ?? null,
+            updatedAt:         r.updatedAt ?? null
+          }))
+        }, null, 2) }]
+      };
+    } catch (err) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: `Error fetching workflow runs: ${err.message}` }) }], isError: true };
     }
   }
 );
