@@ -363,31 +363,6 @@ async function streamReply({ anthropicKey }, sessionId, message, onProgress) {
   const decoder = new TextDecoder();
   let buffer = '';
   let finalText = '';
-  let sawTerminal = false;
-  const seenIds = new Set();
-
-  const applyEvent = (evt) => {
-    if (evt.id) {
-      if (seenIds.has(evt.id)) return;
-      seenIds.add(evt.id);
-    }
-    if (evt.type === 'agent.message' && Array.isArray(evt.content)) {
-      for (const block of evt.content) {
-        if (block.type === 'text' && block.text) finalText += block.text;
-      }
-    } else if (evt.type === 'agent.mcp_tool_use' || evt.type === 'agent.tool_use') {
-      const id = evt.id;
-      if (onProgress && id) onProgress({ kind: 'tool_use', id, name: evt.name || 'tool', input: evt.input || {} });
-    } else if (evt.type === 'agent.mcp_tool_result' || evt.type === 'agent.tool_result') {
-      const id = evt.tool_use_id;
-      if (onProgress && id) onProgress({ kind: 'tool_result', id, isError: !!evt.is_error });
-    } else if (evt.type === 'session.status_idle') {
-      sawTerminal = true;
-    } else if (evt.type === 'session.error') {
-      sawTerminal = true;
-      finalText += `\n_(session error: ${evt.error?.message || 'unknown'})_`;
-    }
-  };
 
   outer: while (true) {
     const { value, done } = await reader.read();
@@ -401,81 +376,27 @@ async function streamReply({ anthropicKey }, sessionId, message, onProgress) {
       if (!data) continue;
       let evt;
       try { evt = JSON.parse(data); } catch { continue; }
-      applyEvent(evt);
-      if (sawTerminal) break outer;
-    }
-  }
-
-  await sendPromise;
-
-  if (!sawTerminal) {
-    // Anthropic's stream has no documented keep-alive, so a silent network/proxy
-    // drop here ends the read loop (`done: true`) exactly the way a clean finish
-    // would — no exception, no session.status_idle. Reconnecting to the same
-    // stream URL does NOT replay missed events (confirmed in Anthropic's docs),
-    // so instead fall back to the session's durable state: poll its status, then
-    // pull the full event history, which reflects the agent's work regardless of
-    // what our connection happened to catch live.
-    console.error(`stream closed without a terminal event for session ${sessionId} — falling back to recovery`);
-    finalText = await recoverFromDroppedStream(anthropicKey, sessionId, seenIds, finalText, onProgress);
-  }
-
-  return finalText;
-}
-
-const RECOVERY_POLL_MS = 3000;
-const RECOVERY_MAX_WAIT_MS = 5 * 60 * 1000;
-
-async function recoverFromDroppedStream(anthropicKey, sessionId, seenIds, finalText, onProgress) {
-  const deadline = Date.now() + RECOVERY_MAX_WAIT_MS;
-  while (true) {
-    let status;
-    try {
-      const res = await fetch(`https://api.anthropic.com/v1/sessions/${sessionId}?beta=true`, {
-        headers: anthropicHeaders(anthropicKey),
-      });
-      if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
-      status = (await res.json()).status;
-    } catch (e) {
-      console.error('recovery: session status fetch failed:', e);
-      break;
-    }
-    if (status === 'idle' || status === 'terminated') break;
-    if (Date.now() > deadline) {
-      console.error('recovery: gave up waiting for session to settle, last status:', status);
-      break;
-    }
-    await new Promise((r) => setTimeout(r, RECOVERY_POLL_MS));
-  }
-
-  try {
-    const res = await fetch(`https://api.anthropic.com/v1/sessions/${sessionId}/events?beta=true`, {
-      headers: anthropicHeaders(anthropicKey),
-    });
-    if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
-    const events = (await res.json()).data || [];
-    for (const evt of events) {
-      if (evt.id) {
-        if (seenIds.has(evt.id)) continue;
-        seenIds.add(evt.id);
-      }
       if (evt.type === 'agent.message' && Array.isArray(evt.content)) {
         for (const block of evt.content) {
           if (block.type === 'text' && block.text) finalText += block.text;
         }
       } else if (evt.type === 'agent.mcp_tool_use' || evt.type === 'agent.tool_use') {
-        if (onProgress && evt.id) onProgress({ kind: 'tool_use', id: evt.id, name: evt.name || 'tool', input: evt.input || {} });
+        const id = evt.id;
+        if (onProgress && id) onProgress({ kind: 'tool_use', id, name: evt.name || 'tool', input: evt.input || {} });
       } else if (evt.type === 'agent.mcp_tool_result' || evt.type === 'agent.tool_result') {
-        if (onProgress && evt.tool_use_id) onProgress({ kind: 'tool_result', id: evt.tool_use_id, isError: !!evt.is_error });
+        const id = evt.tool_use_id;
+        if (onProgress && id) onProgress({ kind: 'tool_result', id, isError: !!evt.is_error });
+      } else if (evt.type === 'session.status_idle') {
+        break outer;
       } else if (evt.type === 'session.error') {
-        finalText += `\n_(session error: ${evt.error?.message || 'unknown'})_`;
+        const msg = evt.error?.message || 'unknown';
+        finalText += `\n_(session error: ${msg})_`;
+        break outer;
       }
     }
-  } catch (e) {
-    console.error('recovery: events list fetch failed:', e);
-    if (!finalText) throw new Error('lost connection to the agent and recovery failed — try asking again');
   }
 
+  await sendPromise;
   return finalText;
 }
 
