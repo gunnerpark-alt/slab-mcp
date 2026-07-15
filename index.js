@@ -13,7 +13,9 @@
  *   get_credits    — Credit cost for one row or aggregated across the table
  *   get_errors     — Per-column status counts (success / error / has-not-run / queued)
  *
- * Terracotta (Clay Workflows) tools — workspace-scoped, read across workspaces:
+ * Terracotta (Clay Workflows) tools — stdio/local only, not registered in the
+ * deployed http-mode server (per-request rebuild cost was a contributor to
+ * production OOM crashes — see the comment above their registration below):
  *   list_workflows    — Discover workflows in a workspace (id, name, lastRunAt)
  *   get_workflow      — A workflow's node graph, edges, flow, validation, input schema
  *   get_workflow_runs — A workflow's run history (status, credits, trigger, timing)
@@ -1920,6 +1922,22 @@ INTERPRETATION: a column with success=0 and error>0 is broken UNLESS its top err
 );
 
 // ---------------------------------------------------------------------------
+// Terracotta (Clay Workflows) tools — stdio/local only.
+//
+// Registering these adds real per-request cost in http mode: every /mcp call
+// rebuilds the whole tool registry from scratch (the SDK's stateless
+// streamable-HTTP pattern requires a fresh McpServer per request — one
+// transport per server instance, so instances can't be shared across
+// concurrent requests). That per-request rebuild cost, multiplied by
+// concurrent traffic, was a contributor to this service's OOM crashes
+// (Render: "Ran out of memory (used over 512MB)"). The deployed instance
+// only serves table/row tools; run these locally via stdio when you need
+// Terracotta.
+// ---------------------------------------------------------------------------
+
+if (transportMode !== 'http') {
+
+// ---------------------------------------------------------------------------
 // Tool: list_workflows  (Terracotta / Clay Workflows)
 // ---------------------------------------------------------------------------
 
@@ -2093,6 +2111,8 @@ This is a summary surface (run list). Full per-node execution detail for a singl
     }
   }
 );
+
+} // end Terracotta tools (stdio/local only)
 
 return server;
 }
