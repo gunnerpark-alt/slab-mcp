@@ -40,6 +40,7 @@ import { handleSlackEvents } from './src/slack.js';
 // ---------------------------------------------------------------------------
 
 const schemaCache = new Map(); // tableId -> schema
+const SCHEMA_CACHE_MAX = 200;
 
 // Subroutine-table mean cost cache, keyed by tableId. Used as a fallback
 // when a parent row's subroutine call points to a function row that's been
@@ -48,6 +49,19 @@ const schemaCache = new Map(); // tableId -> schema
 // Values are Promises during in-flight fetch (concurrency-safe) and
 // resolved means once computed: { meanCredits, meanAiCostUsd, sampleSize }.
 const subroutineFallbackCache = new Map();
+const SUBROUTINE_CACHE_MAX = 200;
+
+// Both caches above are unbounded by table count alone, and this process has run
+// OOM in production (Render: "Ran out of memory (used over 512MB)") — bound them
+// with simple insertion-order LRU eviction rather than letting either grow for the
+// life of the process.
+function cacheSet(map, key, value, max) {
+  if (map.has(key)) map.delete(key);
+  map.set(key, value);
+  if (map.size > max) {
+    map.delete(map.keys().next().value);
+  }
+}
 
 // MCP transport caps a single tool result at ~1MB. Leave headroom for protocol overhead.
 const MCP_RESPONSE_MAX_BYTES = 900_000;
@@ -203,7 +217,7 @@ async function syncTableRecursive(tableId, viewId, {
     let schema = depth === 0 ? null : schemaCache.get(id);
     if (!schema) {
       schema = await getTableSchema(id, view);
-      schemaCache.set(id, schema);
+      cacheSet(schemaCache, id, schema, SCHEMA_CACHE_MAX);
     }
 
     if (depth === 0) {
@@ -257,7 +271,7 @@ async function getSubroutineFields(tableId) {
   let schema = schemaCache.get(tableId);
   if (!schema) {
     schema = await getTableSchema(tableId, null);
-    schemaCache.set(tableId, schema);
+    cacheSet(schemaCache, tableId, schema, SCHEMA_CACHE_MAX);
   }
   const subroutineFields = {};
   for (const f of schema.fields || []) {
@@ -291,7 +305,7 @@ async function estimateSubroutineMean(tableId, sampleSize, maxDepth) {
     if (!schema) {
       try {
         schema = await getTableSchema(tableId, null);
-        schemaCache.set(tableId, schema);
+        cacheSet(schemaCache, tableId, schema, SCHEMA_CACHE_MAX);
       } catch (err) {
         return { meanCredits: 0, meanAiCostUsd: 0, sampleSize: 0, error: err.message };
       }
@@ -333,7 +347,7 @@ async function estimateSubroutineMean(tableId, sampleSize, maxDepth) {
       fetchErrors: fetchErrors.length > 0 ? fetchErrors : undefined
     };
   })();
-  subroutineFallbackCache.set(tableId, promise);
+  cacheSet(subroutineFallbackCache, tableId, promise, SUBROUTINE_CACHE_MAX);
   return promise;
 }
 
@@ -799,7 +813,7 @@ MANIFEST FALLBACK: when the full payload would exceed the MCP transport budget (
         const tableId = t.id || t.tableId;
         try {
           const schema = await getTableSchema(tableId, null);
-          schemaCache.set(tableId, schema);
+          cacheSet(schemaCache, tableId, schema, SCHEMA_CACHE_MAX);
           schemas.push(schema);
         } catch (err) {
           errors.push({ tableId, message: err.message });
@@ -950,7 +964,7 @@ ESCALATION TO NESTED: when query returns exactly one match and the user wants th
         tableId = parsed.tableId;
         if (!schemaCache.get(tableId)) {
           const schema = await getTableSchema(tableId, parsed.viewId);
-          schemaCache.set(tableId, schema);
+          cacheSet(schemaCache, tableId, schema, SCHEMA_CACHE_MAX);
         }
       }
       if (!tableId) {
@@ -1114,7 +1128,7 @@ RETURNS: { totalRows, returnedCount, truncated, view, columns, rows: [{ <colName
         tableId = parsed.tableId;
         if (!schemaCache.get(tableId)) {
           const schema = await getTableSchema(tableId, parsed.viewId);
-          schemaCache.set(tableId, schema);
+          cacheSet(schemaCache, tableId, schema, SCHEMA_CACHE_MAX);
         }
       }
       if (!tableId) {
@@ -1229,7 +1243,7 @@ RETURNS:
         tableId = parsed.tableId;
         if (!schemaCache.get(tableId)) {
           const schema = await getTableSchema(tableId, parsed.viewId);
-          schemaCache.set(tableId, schema);
+          cacheSet(schemaCache, tableId, schema, SCHEMA_CACHE_MAX);
         }
       }
       if (!tableId) {
