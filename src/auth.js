@@ -10,6 +10,10 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { createRequire } from 'module';
+
+const require = createRequire(import.meta.url);
+const { version: PKG_VERSION } = require('../package.json');
 
 const CONFIG_PATH = path.join(os.homedir(), '.slab', 'config.json');
 
@@ -37,10 +41,21 @@ export function getApiKey() {
   );
 }
 
+/**
+ * User-Agent for all outbound requests (Clay API, Slack, Anthropic, Notion,
+ * CSV downloads). Lets upstream services attribute traffic to this server
+ * instead of a bare node-fetch default, and helps support/debugging trace
+ * a request back to a specific slab-mcp build.
+ */
+export function getUserAgent() {
+  return `slab-mcp/${PKG_VERSION} (+https://github.com/gunnerpark-alt/slab-mcp) node/${process.version} ${os.platform()}/${os.arch()}`;
+}
+
 export function getInternalApiHeaders() {
   return {
     'Authorization': getApiKey(),
     'Accept': 'application/json',
-    'Content-Type': 'application/json'
+    'Content-Type': 'application/json',
+    'User-Agent': getUserAgent()
   };
 }
