@@ -1,5 +1,7 @@
 import crypto from 'crypto';
 
+import { getUserAgent } from './auth.js';
+
 const ANTHROPIC_BETA = 'managed-agents-2026-04-01';
 const ANTHROPIC_VERSION = '2023-06-01';
 
@@ -300,7 +302,7 @@ function asPayload(payload) {
 async function postMessage(botToken, channel, thread_ts, payload) {
   const res = await fetch('https://slack.com/api/chat.postMessage', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${botToken}` },
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${botToken}`, 'User-Agent': getUserAgent() },
     body: JSON.stringify({ channel, thread_ts, ...asPayload(payload) }),
   });
   const json = await res.json();
@@ -315,7 +317,7 @@ async function updateOrPost(botToken, channel, thread_ts, ts, payload) {
   if (!ts) return postMessage(botToken, channel, thread_ts, payload);
   const res = await fetch('https://slack.com/api/chat.update', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${botToken}` },
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${botToken}`, 'User-Agent': getUserAgent() },
     body: JSON.stringify({ channel, ts, ...asPayload(payload) }),
   });
   const json = await res.json();
@@ -485,6 +487,7 @@ function anthropicHeaders(key) {
     'anthropic-version': ANTHROPIC_VERSION,
     'anthropic-beta': ANTHROPIC_BETA,
     'content-type': 'application/json',
+    'user-agent': getUserAgent(),
   };
 }
 
@@ -499,7 +502,7 @@ const NOTION_VERSION = '2022-06-28';
 
 async function slackApiGet(botToken, method, params) {
   const url = `https://slack.com/api/${method}?${new URLSearchParams(params)}`;
-  const r = await fetch(url, { headers: { Authorization: `Bearer ${botToken}` } });
+  const r = await fetch(url, { headers: { Authorization: `Bearer ${botToken}`, 'User-Agent': getUserAgent() } });
   return r.json();
 }
 
@@ -508,7 +511,7 @@ async function getBotUserId(botToken) {
   try {
     const r = await fetch('https://slack.com/api/auth.test', {
       method: 'POST',
-      headers: { Authorization: `Bearer ${botToken}` },
+      headers: { Authorization: `Bearer ${botToken}`, 'User-Agent': getUserAgent() },
     });
     const j = await r.json();
     cachedBotUserId = j.user_id || '';
@@ -617,7 +620,7 @@ async function ackFeedback(config, channel, user, thread_ts, kind) {
   try {
     await fetch('https://slack.com/api/chat.postEphemeral', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.botToken}` },
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.botToken}`, 'User-Agent': getUserAgent() },
       body: JSON.stringify({ channel, user, thread_ts, text }),
     });
   } catch (e) {
@@ -630,6 +633,7 @@ function notionHeaders(token) {
     Authorization: `Bearer ${token}`,
     'Notion-Version': NOTION_VERSION,
     'Content-Type': 'application/json',
+    'User-Agent': getUserAgent(),
   };
 }
 

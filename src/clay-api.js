@@ -3,7 +3,7 @@
  * Calls https://api.clay.com/v3/ — the same API the Clay frontend uses.
  */
 
-import { getInternalApiHeaders } from './auth.js';
+import { getInternalApiHeaders, getUserAgent } from './auth.js';
 
 const BASE = 'https://api.clay.com/v3';
 
@@ -228,7 +228,7 @@ export async function exportTableToCsv(tableId, viewId) {
  * Download CSV text from a signed S3 URL returned by exportTableToCsv.
  */
 export async function fetchCsv(downloadUrl) {
-  const res = await fetch(downloadUrl);
+  const res = await fetch(downloadUrl, { headers: { 'User-Agent': getUserAgent() } });
   if (!res.ok) throw new Error(`Failed to download CSV: ${res.status}`);
   return res.text();
 }
