@@ -13,9 +13,9 @@
  *   get_credits    — Credit cost for one row or aggregated across the table
  *   get_errors     — Per-column status counts (success / error / has-not-run / queued)
  *
- * Terracotta (Clay Workflows) tools — stdio/local only, not registered in the
- * deployed http-mode server (per-request rebuild cost was a contributor to
- * production OOM crashes — see the comment above their registration below):
+ * Terracotta (Clay Workflows) tools — registered in every transport mode
+ * (set DISABLE_WORKFLOW_TOOLS=true to drop them from a deployment if memory
+ * pressure returns — see the comment above their registration below):
  *   list_workflows    — Discover workflows in a workspace (id, name, lastRunAt)
  *   get_workflow      — A workflow's node graph, edges, flow, validation, input schema
  *   get_workflow_runs — A workflow's run history (status, credits, trigger, timing)
@@ -627,6 +627,11 @@ function parseCsv(text) {
 // outside this function and are shared across all instances, so per-request
 // instantiation doesn't lose warm Clay schema state.
 
+// Terracotta workflow tools ship in every transport mode; this is an
+// emergency kill switch for the deployment (see the comment above their
+// registration below).
+const workflowToolsEnabled = process.env.DISABLE_WORKFLOW_TOOLS !== 'true';
+
 function createServer() {
 const server = new McpServer({
   name: 'slab',
@@ -734,7 +739,7 @@ Credits:
 
   When a row's full nested JSON would blow the context window (HubSpot/SFDC Lookup columns commonly inflate get_record to 100–300KB), pass slim:true to drop fullContent, or columns=[...] to project to specific fields. Both keep credits/aiProviderCostUsd intact.
 
-== Terracotta / Clay Workflows (read-only) ==
+${workflowToolsEnabled ? `== Terracotta / Clay Workflows (read-only) ==
 
 Slab also reads Clay Workflows (Terracotta) — the multi-node automations, separate from tables. These endpoints are WORKSPACE-SCOPED: they need the numeric workspace ID from the URL (app.clay.com/workspaces/<ws>/terracotta/tc-workflows/<wf>), unlike table IDs which are global. The configured key spans every workspace it can see, so this works across customer workspaces.
 
@@ -746,7 +751,7 @@ Slab also reads Clay Workflows (Terracotta) — the multi-node automations, sepa
 
 get_workflow projects by default (like the table tools): node bodies are omitted, only codeChars sizes are shown, until you pass code:true. Node types: trigger, code (Python), conditional (branching), tool (one Clay action — see actionKey), agent (Claygent/LLM; prompt body is referenced by claygentId, not inlined). flow is the edge list resolved to node names (from → to). To compare flow logic across customers, call get_workflow per workspace and diff the projected structure.
 
-== Builder workflows live in the clay-gtm-architect project, not here ==
+` : ''}== Builder workflows live in the clay-gtm-architect project, not here ==
 
 When the user asks to WRITE, FIX, or REVIEW a Clay formula or a Claygent / Use AI prompt, the workflow lives in the companion clay-gtm-architect project's skills (clay-formulas, clay-prompt-eng) — not in this MCP server. Sync the table for context, then defer to those skills' section structure, casing conventions, and validation rules. If they aren't installed, the user can find them in the clay-gtm-architect project (github.com/gunnerpark-alt/clay-gtm-architect).`
 });
@@ -1922,20 +1927,22 @@ INTERPRETATION: a column with success=0 and error>0 is broken UNLESS its top err
 );
 
 // ---------------------------------------------------------------------------
-// Terracotta (Clay Workflows) tools — stdio/local only.
+// Terracotta (Clay Workflows) tools.
 //
-// Registering these adds real per-request cost in http mode: every /mcp call
-// rebuilds the whole tool registry from scratch (the SDK's stateless
-// streamable-HTTP pattern requires a fresh McpServer per request — one
-// transport per server instance, so instances can't be shared across
-// concurrent requests). That per-request rebuild cost, multiplied by
-// concurrent traffic, was a contributor to this service's OOM crashes
-// (Render: "Ran out of memory (used over 512MB)"). The deployed instance
-// only serves table/row tools; run these locally via stdio when you need
-// Terracotta.
+// These were once gated out of http mode: every /mcp call rebuilds the whole
+// tool registry from scratch (the SDK's stateless streamable-HTTP pattern
+// requires a fresh McpServer per request), and that per-request rebuild cost
+// was suspected as a contributor to Render OOM crashes ("Ran out of memory
+// (used over 512MB)"). The crash cycle (every 15-90 min, memory growing until
+// restart) was driven by the unbounded module-level caches, bounded the same
+// day; the gate was belt-and-suspenders on top of that fix. The tools are
+// registered everywhere again — the deployed server needs them for Slack
+// users to read workflows. If memory pressure returns, set
+// DISABLE_WORKFLOW_TOOLS=true on the deployment to drop them without a code
+// change.
 // ---------------------------------------------------------------------------
 
-if (transportMode !== 'http') {
+if (workflowToolsEnabled) {
 
 // ---------------------------------------------------------------------------
 // Tool: list_workflows  (Terracotta / Clay Workflows)
@@ -2112,7 +2119,7 @@ This is a summary surface (run list). Full per-node execution detail for a singl
   }
 );
 
-} // end Terracotta tools (stdio/local only)
+} // end Terracotta tools (gated only by DISABLE_WORKFLOW_TOOLS)
 
 return server;
 }
